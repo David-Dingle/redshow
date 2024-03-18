@@ -14,6 +14,7 @@ INC_DIR := include/
 BIN_DIR := bin/
 SRC_DIR := src/
 BOOST_INC_DIR := $(BOOST_DIR)/include
+TORCH_INC_DIR := $(PYTORCH_DIR)/include
 BUILD_DIR := build/
 CUR_DIR = $(shell pwd)/
 
@@ -69,14 +70,14 @@ $(LIB_DIR):
 	mkdir -p $@
 
 $(BINS): % : $(SRC_DIR)%.cpp $(OBJECTS)
-	$(CC) $(CFLAGS) -I$(INC_DIR) -I$(BOOST_DIR)/include -I$(GPU_PATCH_DIR)/include -I$(TORCH_MONITOR_DIR)/include \
+	$(CC) $(CFLAGS) -I$(INC_DIR) -I$(BOOST_DIR)/include -I$(GPU_PATCH_DIR)/include -I$(TORCH_MONITOR_DIR)/include -I$(TORCH_INC_DIR) \
 -L$(TORCH_MONITOR_DIR)/lib -Wl,-rpath=$(TORCH_MONITOR_DIR)/lib -L$(LIBUNWIND_DIR)/lib -o $@ $^ -ltorch_monitor -lunwind
 
 $(LIB): $(OBJECTS)
 	$(CC) $(LDFLAGS) -L$(TORCH_MONITOR_DIR)/lib -Wl,-rpath=$(TORCH_MONITOR_DIR)/lib -o $@ $^ -ltorch_monitor
 
 $(OBJECTS): $(BUILD_DIR)%.o : %.cpp
-	$(CC) $(CFLAGS) -I$(INC_DIR) -I$(BOOST_DIR)/include -I$(GPU_PATCH_DIR)/include \
+	$(CC) $(CFLAGS) -I$(INC_DIR) -I$(BOOST_DIR)/include -I$(GPU_PATCH_DIR)/include -I$(TORCH_INC_DIR) \
 -I$(TORCH_MONITOR_DIR)/include -I$(LIBUNWIND_DIR)/include -o $@ -c $<
 
 clean:
