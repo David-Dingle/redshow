@@ -173,6 +173,11 @@ EXTERNC redshow_result_t redshow_get_op_id_register(redshow_get_op_id func);
 EXTERNC redshow_result_t redshow_torch_enable();
 
 /**
+ * @brief enable pytorch view analysis
+ */
+EXTERNC redshow_result_t redshow_torch_view_enable();
+
+/**
  * @brief This function is used to setup specific analysis types.
  *
  * @param analysis_type

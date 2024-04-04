@@ -42,30 +42,30 @@ namespace redshow {
   }
 
   void TorchView::memory_op_callback(std::shared_ptr<Memory> op, bool is_submemory) {
-    update_op_node(op->op_id, op->ctx_id);
-
-    if (!is_submemory) {
-      _memories.try_emplace(op->op_id, op);
-      _current_memories.try_emplace(op->op_id, op);
-      _op_node.emplace(op->op_id, op->ctx_id);
-      _op_type.emplace(op->op_id, "ALLOC");
-
-      _addresses_map.try_emplace(op->memory_range.start, op->op_id);
-      _current_memory_usage += op->len;
-      _nums_cudamalloc++;
-
-      if (_current_memory_usage > _memory_peak)
-        _memory_peak = _current_memory_usage;
-    } else {
-      _submemories.try_emplace(op->op_id, op);
-      _current_submemories.try_emplace(op->op_id, op);
-      _sub_addresses_map.try_emplace(op->memory_range.start, op->op_id);
-      _current_submemory_usage += op->len;
-
-      if (_current_submemory_usage > _submemory_peak) {
-        _submemory_peak = _current_submemory_usage;
-      }
-    }
+//    update_op_node(op->op_id, op->ctx_id);
+//
+//    if (!is_submemory) {
+//      _memories.try_emplace(op->op_id, op);
+//      _current_memories.try_emplace(op->op_id, op);
+//      _op_node.emplace(op->op_id, op->ctx_id);
+//      _op_type.emplace(op->op_id, "ALLOC");
+//
+//      _addresses_map.try_emplace(op->memory_range.start, op->op_id);
+//      _current_memory_usage += op->len;
+//      _nums_cudamalloc++;
+//
+//      if (_current_memory_usage > _memory_peak)
+//        _memory_peak = _current_memory_usage;
+//    } else {
+//      _submemories.try_emplace(op->op_id, op);
+//      _current_submemories.try_emplace(op->op_id, op);
+//      _sub_addresses_map.try_emplace(op->memory_range.start, op->op_id);
+//      _current_submemory_usage += op->len;
+//
+//      if (_current_submemory_usage > _submemory_peak) {
+//        _submemory_peak = _current_submemory_usage;
+//      }
+//    }
   }
 
   /**
@@ -248,25 +248,25 @@ namespace redshow {
 
   void TorchView::flush(const std::string &output_dir, const LockableMap<u32, Cubin> &cubins,
                            redshow_record_data_callback_func record_data_callback) {
-    std::ofstream output(output_dir + "memory_info.txt");
-    output << "GPU memory peak: " << _memory_peak << " B" << std::endl;
-    output << "Optimal GPU memory peak: " << _optimal_memory_peak << " B" << std::endl;
-    output << "Peak kernel op id: " << _memory_peak_kernel << std::endl;
-    output << "Number of cudaMallocs: " << _nums_cudamalloc << std::endl;
-    output << "Number of cudaFrees: " << _nums_cudafree << std::endl;
-    output << std::endl;
-
-    output << "Submemory peak: " << _submemory_peak << " B" << std::endl;
-    output << "Optimal submemory peak: " << _optimal_submemory_peak << " B" << std::endl;
-    output << "Peak kernel op id: " << _submemory_peak_kernel << std::endl;
-
-    output.close();
-
-    std::ofstream out(output_dir + "memory_info.csv");
-    for (auto op : _op_node) {
-      out << "op_id: " << op.first << ", " << _op_type[op.first] << " " << op.second << std::endl;
-    }
-    out.close();
+//    std::ofstream output(output_dir + "memory_info.txt");
+//    output << "GPU memory peak: " << _memory_peak << " B" << std::endl;
+//    output << "Optimal GPU memory peak: " << _optimal_memory_peak << " B" << std::endl;
+//    output << "Peak kernel op id: " << _memory_peak_kernel << std::endl;
+//    output << "Number of cudaMallocs: " << _nums_cudamalloc << std::endl;
+//    output << "Number of cudaFrees: " << _nums_cudafree << std::endl;
+//    output << std::endl;
+//
+//    output << "Submemory peak: " << _submemory_peak << " B" << std::endl;
+//    output << "Optimal submemory peak: " << _optimal_submemory_peak << " B" << std::endl;
+//    output << "Peak kernel op id: " << _submemory_peak_kernel << std::endl;
+//
+//    output.close();
+//
+//    std::ofstream out(output_dir + "memory_info.csv");
+//    for (auto op : _op_node) {
+//      out << "op_id: " << op.first << ", " << _op_type[op.first] << " " << op.second << std::endl;
+//    }
+//    out.close();
   }
 
 }  // namespace redshow

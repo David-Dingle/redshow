@@ -1,6 +1,9 @@
 //
 // Created by xjding on 1/1/24.
-// TODO: Call path; Early stop for tensor strides sorting with the aid of transpose flag; GPA; Debugging
+// TODO(XJDing):
+//  is callback func mutax needed?
+//  where comes the double free (!prev) error?
+//  C/CUDA Call path; Early stop for tensor strides sorting with the aid of transpose flag; GPA; Debugging
 //
 
 #ifndef REDSHOW_ANALYSIS_TORCH_VIEW_H
@@ -22,7 +25,7 @@
 #include "operation/memfree.h"
 #include "operation/operation.h"
 #include "redshow.h"
-#include "c10/core/ScalarTypeToTypeMeta.h"
+#include <iostream>
 
 #include "/home/xjding/Projects/new_DrGPUM/DrGPUM/torch-monitor/include/torch_monitor.h"
 
@@ -77,7 +80,7 @@ namespace redshow {
      int64_t numel;  // number of tensor elements
      int64_t dim;
      torch_monitor_scalar_type_t dtype;  // pytorch tensor.dtype (scalar type)
-     int64_t item_size;
+     uint64_t itemsize;
      int64_t storage_offset;
      int64_t sizes[TORCH_MONITOR_MAX_TENSOR_DIMENSION];
      int64_t strides[TORCH_MONITOR_MAX_TENSOR_DIMENSION];
@@ -85,37 +88,39 @@ namespace redshow {
      metadata_ptr_t metadata_ptr;
      mem_range_t mem_block_range;  // <block start, block end>
      int _total_access = 0;
-     std::vector<std::shared_ptr<ViewNode>> _children = {};
+     std::vector<ViewNode*> _children = {};
 
      public:
        /**temp object for searching*/
       ViewNode(data_ptr_t data_ptr, metadata_ptr_t metadata_ptr):data_ptr(data_ptr), metadata_ptr(metadata_ptr) {}
 
       /**for root nodes*/
-      ViewNode(int64_t index, int64_t numel, int64_t dim, torch_monitor_scalar_type_t dtype, int64_t storage_offset,
+      ViewNode(int64_t index, int64_t numel, int64_t dim, torch_monitor_scalar_type_t dtype, uint64_t itemsize, int64_t storage_offset,
                int64_t sizes[], int64_t strides[], data_ptr_t data_ptr, metadata_ptr_t metadata_ptr):
-               index(index), numel(numel), dim(dim), dtype(dtype), storage_offset(storage_offset), data_ptr(data_ptr),
+               index(index), numel(numel), dim(dim), dtype(dtype), itemsize(itemsize), storage_offset(storage_offset), data_ptr(data_ptr),
                metadata_ptr(metadata_ptr){
-        this->item_size = c10::scalarTypeToTypeMeta(c10::ScalarType(dtype)).itemsize();
         for(int i = 0; i < std::min<int>(TORCH_MONITOR_MAX_TENSOR_DIMENSION, dim); i ++){
           this->sizes[i] = sizes[i];
           this->strides[i] = strides[i];
         }
-        this->mem_block_range = mem_range_t{data_ptr, data_ptr+(item_size * numel)};
+        this->mem_block_range = mem_range_t{data_ptr, data_ptr+(itemsize * numel)};
       }
 
       /**other nodes*/
-      ViewNode(int64_t index, int64_t numel, int64_t dim, torch_monitor_scalar_type_t dtype, int64_t storage_offset,
+      ViewNode(int64_t index, int64_t numel, int64_t dim, torch_monitor_scalar_type_t dtype, uint64_t itemsize, int64_t storage_offset,
                int64_t sizes[], int64_t strides[], data_ptr_t data_ptr, metadata_ptr_t metadata_ptr,
                mem_range_t mem_block_range):
-               index(index), numel(numel), dim(dim), dtype(dtype), storage_offset(storage_offset), data_ptr(data_ptr),
+               index(index), numel(numel), dim(dim), dtype(dtype), itemsize(itemsize), storage_offset(storage_offset), data_ptr(data_ptr),
                metadata_ptr(metadata_ptr){
-        this->item_size = c10::scalarTypeToTypeMeta(c10::ScalarType(dtype)).itemsize();
         this->mem_block_range = mem_range_t{mem_block_range};
         for(int i = 0; i < std::min<int>(TORCH_MONITOR_MAX_TENSOR_DIMENSION, dim); i ++){
           this->sizes[i] = sizes[i];
           this->strides[i] = strides[i];
         }
+      }
+
+      ~ViewNode(){
+        std::cout<< "destruct: " << (uint64_t)this->data_ptr << std::endl;
       }
 
       bool operator==(const ViewNode& r_val) {
@@ -127,19 +132,21 @@ namespace redshow {
        * return node ptr if the view sits on this branch
        * return null if the view sits nowhere on this branch
        * */
-      std::shared_ptr<ViewNode> find_node(ViewNode r_node) {
-        if (*(this) == r_node)
-          return (std::shared_ptr<ViewNode>) this;
-        else if (!this->_children.empty()) {
-          std::shared_ptr<ViewNode> res = std::shared_ptr<ViewNode>();
+      ViewNode* find_node(ViewNode r_node) {
+        if (*(this) == r_node) {
+          return this;
+        }
+        if (!(this->_children.empty())) {
+          ViewNode* res = nullptr;
           for (auto node : this->_children) {
             res = node->find_node(r_node);
-            if (!res)
+            if (res) {
               return res;  // return the node ptr
+            }
           }
           return res;  // not found return nullptr
         } else {
-          return std::shared_ptr<ViewNode>();  // this._children is empty
+          return nullptr;  // this._children is empty
         }
       }
 
@@ -151,13 +158,16 @@ namespace redshow {
         if (! this->is_leaf_node()) {
           for (auto child : this->_children) {
             child->delete_children_nodes();
+            delete child;
           }
           this->_children.clear();
         }
       }
    };
 
-   std::vector<std::shared_ptr<ViewNode>> _roots = {};  // The node forest //TODO: optimize
+   std::vector<ViewNode*> _roots = {};  // The node forest //TODO: optimize
+
+   std::vector<mem_range_t> gpu_mem_blocks = {};
 
    // push <op_name, visible inputs(tensors)> while domain enter
    // pop op_name while domain exit
@@ -165,13 +175,13 @@ namespace redshow {
    torch_monitor_op_data_t _popped_op = torch_monitor_op_data_t();
 
    /** find view root from the forest */
-   std::shared_ptr<ViewNode> find_root_node(ViewNode r_node) {
+   ViewNode* find_root_node(ViewNode r_node) {
      for (auto node : _roots){
        if (r_node.data_ptr >= node->mem_block_range.first && r_node.data_ptr <= node->mem_block_range.second){
          return node;
        }
      }
-       return std::shared_ptr<ViewNode>();
+     return nullptr;
    }
 
   /**
@@ -184,50 +194,76 @@ namespace redshow {
    * 2. else, create a root node
    * */
    void update_view_forest(torch_monitor_callback_tensor_data_t& tensor_data) {
-     data_ptr_t data_ptr = reinterpret_cast<data_ptr_t>(tensor_data.data_ptr);
-     metadata_ptr_t metadata_ptr = reinterpret_cast<metadata_ptr_t>(tensor_data.metadata_ptr);
+     lock();
+
+     data_ptr_t data_ptr = (data_ptr_t)tensor_data.data_ptr;
+     metadata_ptr_t metadata_ptr = (metadata_ptr_t)tensor_data.metadata_ptr;
      ViewNode temp = ViewNode{data_ptr, metadata_ptr};
-     std::shared_ptr<ViewNode> root_found = find_root_node(temp);
+    ViewNode* root_found = find_root_node(temp);
      if(root_found){
-       std::shared_ptr<ViewNode> view_existed = root_found->find_node(temp);
-       if(!view_existed){
-           /** insert new view node into correct "view_node._children"
-            * 1. find the father node from the root/branch
-            * 2. create a new node and insert into its "_children"
-            * */
-           // fetch the closest pytorch callback op inputs from the stack
-         for (int64_t i = 0; i < _popped_op.input_output_data.size; i++) {
-           torch_monitor_callback_tensor_data_t _tensor = _popped_op.input_output_data.tensor_data[i];
+       ViewNode* view_existed = root_found->find_node(temp);
+       if(view_existed){ // update _total_access counter
+         view_existed->_total_access++;
+       } else { // found the view node in the forest
+         /** insert new view node into correct "view_node._children"
+           * 1. find the father node from the root/branch
+           * 2. create a new node and insert into its "_children"
+           * */
+         // fetch the closest pytorch callback op inputs from the stack (popped op)
+         for (int64_t i = 0; i < _op_stack.top().input_output_data.size; i++) {
+           torch_monitor_callback_tensor_data_t _tensor = _op_stack.top().input_output_data.tensor_data[i];
            if (_tensor.index == -1 || _tensor.numel <= 0)
-               continue;
-           data_ptr_t _tensor_data_ptr = reinterpret_cast<data_ptr_t>(_tensor.data_ptr);
-           metadata_ptr_t _tensor_metadata_ptr = reinterpret_cast<metadata_ptr_t>(_tensor.metadata_ptr);
+             continue;
+           data_ptr_t _tensor_data_ptr = (data_ptr_t)_tensor.data_ptr;
+           metadata_ptr_t _tensor_metadata_ptr = (metadata_ptr_t)_tensor.metadata_ptr;
            ViewNode _input_temp = ViewNode{_tensor_data_ptr, _tensor_metadata_ptr};
-           std::shared_ptr<ViewNode> _input_root = find_root_node(_input_temp);
-           std::shared_ptr<ViewNode> _input_view = _input_root->find_node(_input_temp);
+           ViewNode* _input_root = root_found; //find_root_node(_input_temp);
+           ViewNode* _input_view = _input_root->find_node(_input_temp);
+           if (!_input_view) // if the candidate father does not exist ; continue and look on the next one
+             continue;
            if ((data_ptr_t)tensor_data.data_ptr >= _input_view->mem_block_range.first && (data_ptr_t)tensor_data.data_ptr <= _input_view->mem_block_range.second) {
-               // add the tensor_data to _tensor(node)'s children
-             std::shared_ptr<ViewNode> _node = std::make_shared<ViewNode>(tensor_data.index, tensor_data.numel, tensor_data.dim, tensor_data.dtype,
+             // add the tensor_data to _tensor(node)'s children
+             ViewNode* _node = new ViewNode(tensor_data.index, tensor_data.numel, tensor_data.dim, tensor_data.dtype, tensor_data.itemsize,
                                                                           tensor_data.storage_offset, tensor_data.sizes, tensor_data.strides, data_ptr,
                                                                           metadata_ptr, _input_view->mem_block_range);
              _input_view->_children.push_back(_node);
+             break;
            }
          }
        }
-     } else {
-         ViewNode _node = ViewNode{tensor_data.index, tensor_data.numel, tensor_data.dim, tensor_data.dtype,
-                                   tensor_data.storage_offset, tensor_data.sizes, tensor_data.strides, data_ptr,
-                                   metadata_ptr};
-         std::shared_ptr<ViewNode> _node_ptr = std::make_shared<ViewNode>(_node);
-         _roots.push_back(_node_ptr);  // add a new root
-       }
+     } else { // add a new root
+       ViewNode* _root_node_ptr = new ViewNode(tensor_data.index, tensor_data.numel, tensor_data.dim, tensor_data.dtype, tensor_data.itemsize,
+                                                                               tensor_data.storage_offset, tensor_data.sizes, tensor_data.strides, data_ptr,
+                                                                               metadata_ptr);
+       _roots.push_back(_root_node_ptr);
+     } // add a new root
+     unlock();
    }
+
+   /**
+    * Print out the view forest for debugging use
+    */
+#ifdef DEBUG
+   void visualize_view_forest(ViewNode* root, int indent_level = 0, const char* indent = "    |"){
+     for (int i = 0; i < indent_level; i++)
+       std::cout << indent;
+     std::cout << "D_ptr: " << root->data_ptr << " M_ptr: " << root->metadata_ptr << " Range_f: " << root->mem_block_range.first << " Range_s: " << root->mem_block_range.second << " Access: " << root->_total_access;
+     if (!root->_children.empty()){
+       for (ViewNode* citer : root->_children) {
+         visualize_view_forest(citer, indent_level + 1, indent);
+       }
+     } else {
+       std::cout << std::endl;
+     }
+   }
+#endif
 
    /**
     * delete a tree(gaven a tensor ptr) from the forest
     *@param mem_start_addr: starting address of memory range
     */
    void delete_forest_tree(data_ptr_t mem_start_addr) {
+     lock();
      for (int i =0; i < _roots.size(); i++) {
        if (_roots.at(i)->mem_block_range.first == mem_start_addr){
          _roots.at(i)->delete_children_nodes();
@@ -235,19 +271,22 @@ namespace redshow {
          break;
        }
      }
+     unlock();
    }
 
    /**
     * add view_node _total_access by one
     * @param a list of view_nodes
-    * TODO: call this func at project stage 3, (use data_ptr, offset, stride, item_size to spot the view_node which needs update)
+    * TODO: call this func at project stage 3, (use data_ptr, offset, stride, itemsize to spot the view_node which needs update)
     */
-   void update_node__total_access(std::vector<std::shared_ptr<ViewNode>> view_nodes) {
+   void update_node__total_access(std::vector<ViewNode*> view_nodes) {
+     lock();
      for (auto viter : view_nodes) {
-       std::shared_ptr<ViewNode> _root_node = find_root_node(*(viter.get()));
-       std::shared_ptr<ViewNode> _node = _root_node->find_node(*(viter.get()));
+       ViewNode* _root_node = find_root_node(*viter);
+       ViewNode* _node = _root_node->find_node(*viter);
        _node->_total_access++;
      }
+     unlock();
    }
 
    /**
@@ -284,22 +323,22 @@ namespace redshow {
     * Binary search on the given dimension
     * @param size: size on given dimension
     * @param stride stride in given dimension
-    * @param item_size sizeof(tensor.dtype)
+    * @param itemsize sizeof(tensor.dtype)
     * @param mem_addr_hit
     * @return
     */
-   u64 find_local_starting_address(u64 init_address, int64_t size, int64_t stride, int64_t item_size, u64 mem_addr_hit) {
+   u64 find_local_starting_address(u64 init_address, int64_t size, int64_t stride, uint64_t itemsize, u64 mem_addr_hit) {
      if (size >= 1){
-       u64 sit = init_address + ((size-1) / 2) * item_size * stride;
+       u64 sit = init_address + ((size-1) / 2) * itemsize * stride;
        if (sit == mem_addr_hit) {
          return sit;
        } else if (sit > mem_addr_hit){
-         return find_local_starting_address(init_address, ((size-1) / 2), stride, item_size, mem_addr_hit);
+         return find_local_starting_address(init_address, ((size-1) / 2), stride, itemsize, mem_addr_hit);
        } else { // sit < mem_addr_hit
-         if ((sit + item_size * stride) > mem_addr_hit) {
+         if ((sit + itemsize * stride) > mem_addr_hit) {
            return sit;
          } else {
-           return find_local_starting_address((sit + item_size * stride), (size - (size / 2)), stride, item_size, mem_addr_hit);
+           return find_local_starting_address((sit + itemsize * stride), (size - (size / 2)), stride, itemsize, mem_addr_hit);
          }
        }
      } else {
@@ -310,10 +349,10 @@ namespace redshow {
     * recursive function that always return the updated dimensional starting address
     *
     * @param tensor: a temp value with gradually smaller dimension while recursion
-    * @param item_size: sizeof(tensor.dtype) c10::scalarTypeToTypeMeta(c10::ScalarType(dtype)).itemsize();
+    * @param itemsize: sizeof(tensor.dtype) c10::scalarTypeToTypeMeta(c10::ScalarType(dtype)).itemsize();
     * @return the address of
     */
-   u64 find_closest_starting_address(torch_monitor_callback_tensor_data_t temp_tensor, int64_t item_size, u64 mem_addr_hit){
+   u64 find_closest_starting_address(torch_monitor_callback_tensor_data_t temp_tensor, uint64_t itemsize, u64 mem_addr_hit){
      int64_t * sizes = temp_tensor.sizes;
      int64_t * strides = temp_tensor.strides;
      int64_t dim = temp_tensor.dim;
@@ -322,7 +361,7 @@ namespace redshow {
      else {
        u64 sit = (u64)temp_tensor.data_ptr;
        for(int64_t i = 0; i < (dim-1); i++) {
-         sit = find_local_starting_address(sit, sizes[i], strides[i], item_size, mem_addr_hit);
+         sit = find_local_starting_address(sit, sizes[i], strides[i], itemsize, mem_addr_hit);
          if(sit == 0)
            break;
        }
@@ -342,11 +381,11 @@ namespace redshow {
    * @param memory_address: address visited on GPU
    * @return the tensor/view been accessed
    */
-   std::vector<std::shared_ptr<ViewNode>> get_view_nodes_by_mem_addr(u64 mem_addr_hit) {
+   std::vector<ViewNode*> get_view_nodes_by_mem_addr(u64 mem_addr_hit) {
      std::vector<torch_monitor_callback_tensor_data_t> possible = {};
      std::vector<torch_monitor_callback_tensor_data_t> sorted = {};
      std::vector<torch_monitor_callback_tensor_data_t> hit = {};
-     std::vector<std::shared_ptr<ViewNode>> res = {};
+     std::vector<ViewNode*> res = {};
      torch_monitor_op_data_t op_info = _op_stack.top();
      torch_monitor_input_output_data_t inputs = op_info.input_output_data;
      for (int64_t i = 0; i < inputs.size; i++) {
@@ -356,8 +395,8 @@ namespace redshow {
        data_ptr_t _tensor_data_ptr = reinterpret_cast<data_ptr_t>(_tensor.data_ptr);
        metadata_ptr_t _tensor_metadata_ptr = reinterpret_cast<metadata_ptr_t>(_tensor.metadata_ptr);
        ViewNode _input_temp = ViewNode{_tensor_data_ptr, _tensor_metadata_ptr};
-       std::shared_ptr<ViewNode> _input_root = find_root_node(_input_temp);
-       std::shared_ptr<ViewNode> _input_view = _input_root->find_node(_input_temp);
+       ViewNode* _input_root = find_root_node(_input_temp);
+       ViewNode* _input_view = _input_root->find_node(_input_temp);
        // possible: hit-address roughly fall into view_node.mem_block_range
        if ((data_ptr_t)mem_addr_hit >= _input_view->mem_block_range.first && (data_ptr_t)mem_addr_hit <= _input_view->mem_block_range.second) {
          possible.push_back(_tensor);
@@ -369,12 +408,12 @@ namespace redshow {
      }
      // find hit tensor
      for(int i = 0; i < sorted.size(); i++){
-       int64_t item_size = c10::scalarTypeToTypeMeta(c10::ScalarType(sorted[i].dtype)).itemsize();
-       u64 sit = find_closest_starting_address(sorted[i], item_size, mem_addr_hit);
+       uint64_t itemsize = sorted[i].itemsize;
+       u64 sit = find_closest_starting_address(sorted[i], itemsize, mem_addr_hit);
        if(sit != 0){
-         if((mem_addr_hit - sit) / (sorted[i].strides[sorted[i].dim - 1] * item_size) < sorted[i].sizes[sorted[i].dim - 1]
+         if((mem_addr_hit - sit) / (sorted[i].strides[sorted[i].dim - 1] * itemsize) < sorted[i].sizes[sorted[i].dim - 1]
            &&
-           (mem_addr_hit - sit) % (sorted[i].strides[sorted[i].dim - 1] * item_size) == 0){
+           (mem_addr_hit - sit) % (sorted[i].strides[sorted[i].dim - 1] * itemsize) == 0){
            hit.push_back(sorted[i]);
          }
        }
@@ -384,8 +423,8 @@ namespace redshow {
        data_ptr_t _hit_data_ptr = reinterpret_cast<data_ptr_t>(hit[i].data_ptr);
        metadata_ptr_t _hit_metadata_ptr = reinterpret_cast<metadata_ptr_t>(hit[i].metadata_ptr);
        ViewNode _input_temp = ViewNode{_hit_data_ptr, _hit_metadata_ptr};
-       std::shared_ptr<ViewNode> _input_root = find_root_node(_input_temp);
-       std::shared_ptr<ViewNode> _input_view = _input_root->find_node(_input_temp);
+       ViewNode* _input_root = find_root_node(_input_temp);
+       ViewNode* _input_view = _input_root->find_node(_input_temp);
        res.push_back(_input_view);
      }
      return res;

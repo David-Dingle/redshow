@@ -144,6 +144,8 @@ static void torch_callback_inputs_outputs_report(torch_monitor_callback_site_t c
     std::cout << "    Tensor dim: " << (std::int64_t)tensor.dim << std::endl;
     std::cout << "    Tensor dtype: " << torch_monitor_dtype_name_get(tensor.dtype)
               << std::endl;
+    std::cout << "    Tensor itemsize: " << tensor.itemsize
+              << std::endl;
     std::cout << "    Tensor storage offset: " << (std::int64_t)tensor.storage_offset
               << std::endl;
     std::cout << "    Tensor sizes: ";
@@ -185,7 +187,7 @@ static void python_state_report() {
  * */
 static void torch_view_callback(torch_monitor_callback_site_t callback_site,
                                   torch_monitor_callback_data_t* callback_data) {
-  std::lock_guard<std::mutex> lock_guard(mtx);
+  // std::lock_guard<std::mutex> lock_guard(mtx);
   std::cout << "-----------------------------------" << std::endl;
   if (callback_site == TORCH_MONITOR_CALLBACK_ENTER) {
     std::cout << "Enter Domain: " << callback_data->domain << std::endl;
@@ -232,6 +234,11 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
           if (iter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
             std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
             analysis_ptr->delete_forest_tree((redshow::TorchView::data_ptr_t)callback_data->data.mem_data.ptr);
+#ifdef DEBUG
+            for (auto titer : analysis_ptr->_roots){
+              analysis_ptr->visualize_view_forest(titer);
+            }
+#endif
           }
         }  // ends removing
       }
@@ -271,11 +278,21 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
       for (auto iter : analysis_enabled){
         if (iter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
           std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
-          analysis_ptr->_popped_op = analysis_ptr->_op_stack.top();
-          analysis_ptr->_op_stack.pop();
-          for (auto titer : analysis_ptr->_popped_op.input_output_data.tensor_data) {
-            analysis_ptr->update_view_forest(titer);  // update the view forest
+          if (analysis_ptr->_op_stack.size() > 0) {
+            analysis_ptr->_popped_op = analysis_ptr->_op_stack.top();
+            for (int64_t i = 0 ; i < callback_data->data.op_data.input_output_data.size; i ++) {
+              torch_monitor_callback_tensor_data_t titer = callback_data->data.op_data.input_output_data.tensor_data[i];
+              if (titer.index == -1 || titer.numel <= 0)
+                continue;
+              analysis_ptr->update_view_forest(titer);  // update the view forest
+            }
+            analysis_ptr->_op_stack.pop();
           }
+#ifdef DEBUG
+          for (auto titer : analysis_ptr->_roots){
+            analysis_ptr->visualize_view_forest(titer);
+          }
+#endif
         }
       }
       torch_callback_inputs_outputs_report(callback_site, callback_data);
@@ -815,48 +832,49 @@ redshow_result_t redshow_torch_enable() {
 }
 
 redshow_result_t redshow_torch_view_enable() {
-    torch_monitor_status status = torch_monitor_domain_enable(TORCH_MONITOR_DOMAIN_FUNCTION);
-    if (status != TORCH_MONITOR_STATUS_SUCCESS) {
-        std::cerr << "Torch monitor status: " << status << std::endl;
-        exit(1);
-    }
+  /**
+   * enable inputs outputs capturing
+   */
+  torch_monitor_inputs_capture_enable_set(true);
+  torch_monitor_outputs_capture_enable_set(true);
+  if (!(torch_monitor_inputs_capture_enable_get() && torch_monitor_outputs_capture_enable_get())) {
+    std::cerr << "Inputs and Outputs capturing is not enabled." << std::endl;
+    exit(1);
+  }
 
-    status = torch_monitor_domain_enable(TORCH_MONITOR_DOMAIN_BACKWARD_FUNCTION);
-    if (status != TORCH_MONITOR_STATUS_SUCCESS) {
-        std::cerr << "Torch monitor status: " << status << std::endl;
-        exit(1);
-    }
+  torch_monitor_status status = torch_monitor_domain_enable(TORCH_MONITOR_DOMAIN_FUNCTION);
+  if (status != TORCH_MONITOR_STATUS_SUCCESS) {
+    std::cerr << "Torch monitor status: " << status << std::endl;
+    exit(1);
+  }
 
-    status = torch_monitor_domain_enable(TORCH_MONITOR_DOMAIN_MEMORY);
-    if (status != TORCH_MONITOR_STATUS_SUCCESS) {
-        std::cerr << "Torch monitor status: " << status << std::endl;
-        exit(1);
-    }
-    /**
-     * "torch_view_callback"
-     * the updated driver func that enabled function callback inputs/outputs capturing
-     * */
-    status = torch_monitor_callback_subscribe(torch_view_callback);
-    if (status != TORCH_MONITOR_STATUS_SUCCESS) {
-        std::cerr << "Torch monitor status: " << status << std::endl;
-        exit(1);
-    }
-    status = torch_monitor_init();
-    if (status != TORCH_MONITOR_STATUS_SUCCESS) {
-        std::cerr << "Torch monitor status: " << status << std::endl;
-        exit(1);
-    }
+  status = torch_monitor_domain_enable(TORCH_MONITOR_DOMAIN_BACKWARD_FUNCTION);
+  if (status != TORCH_MONITOR_STATUS_SUCCESS) {
+    std::cerr << "Torch monitor status: " << status << std::endl;
+    exit(1);
+  }
 
-    /**
-     * enable inputs outputs capturing
-     */
-    torch_monitor_inputs_capture_enable_set(true);
-    torch_monitor_outputs_capture_enable_set(true);
-    if (torch_monitor_inputs_capture_enable_get() && torch_monitor_outputs_capture_enable_get()) {
-      std::cout << "Inputs and Outputs capturing is not enabled.";
-      exit(1);
-    }
-    return REDSHOW_SUCCESS;
+  status = torch_monitor_domain_enable(TORCH_MONITOR_DOMAIN_MEMORY);
+  if (status != TORCH_MONITOR_STATUS_SUCCESS) {
+    std::cerr << "Torch monitor status: " << status << std::endl;
+    exit(1);
+  }
+  /**
+   * "torch_view_callback"
+   * the updated driver func that enabled function callback inputs/outputs capturing
+   * */
+  status = torch_monitor_callback_subscribe(torch_view_callback);
+  if (status != TORCH_MONITOR_STATUS_SUCCESS) {
+    std::cerr << "Torch monitor status: " << status << std::endl;
+    exit(1);
+  }
+  status = torch_monitor_init();
+  if (status != TORCH_MONITOR_STATUS_SUCCESS) {
+    std::cerr << "Torch monitor status: " << status << std::endl;
+    exit(1);
+  }
+
+  return REDSHOW_SUCCESS;
 }
 
 // invoked by sanitizer-api.c
@@ -874,7 +892,7 @@ redshow_result_t redshow_get_op_id_register(redshow_get_op_id func) {
  */
 redshow_result_t redshow_analysis_enable(redshow_analysis_type_t analysis_type) {
   PRINT("\nredshow-> Enter redshow_analysis_enable\nanalysis_type: %u\n", analysis_type);
-
+  printf("Enter Sanitizer %u enable \n", analysis_type);
   redshow_result_t result = REDSHOW_SUCCESS;
 
   switch (analysis_type) {
@@ -1420,6 +1438,8 @@ redshow_result_t redshow_record_data_callback_register(redshow_record_data_callb
 }
 
 redshow_result_t redshow_tool_dtoh_register(redshow_tool_dtoh_func func) {
+  std::cout << "modules we have: ";
+  std::cout << analysis_enabled.size() << std::endl;
   for (auto &aiter : analysis_enabled) {
     aiter.second->dtoh_register(func);
   }
