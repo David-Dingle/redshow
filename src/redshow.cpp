@@ -160,9 +160,9 @@ static void torch_callback_inputs_outputs_report(torch_monitor_callback_site_t c
       std::cout << tensor.strides[j] << ", ";
     }
     std::cout << std::endl;
-    std::cout << "    Tensor block address: " << std::hex << tensor.data_ptr << std::dec
+    std::cout << "    Tensor block address: " << /**std::hex <<*/ (u64)tensor.data_ptr << std::dec
               << std::endl;
-    std::cout << "    Intrusive Ptr: " << std::hex << tensor.metadata_ptr << std::dec
+    std::cout << "    Intrusive Ptr: " << /**std::hex <<*/ (u64)tensor.metadata_ptr << std::dec
               << std::endl;
   }
 }
@@ -187,7 +187,7 @@ static void python_state_report() {
  * */
 static void torch_view_callback(torch_monitor_callback_site_t callback_site,
                                   torch_monitor_callback_data_t* callback_data) {
-  // std::lock_guard<std::mutex> lock_guard(mtx);
+  std::lock_guard<std::mutex> lock_guard(mtx);
   std::cout << "-----------------------------------" << std::endl;
   if (callback_site == TORCH_MONITOR_CALLBACK_ENTER) {
     std::cout << "Enter Domain: " << callback_data->domain << std::endl;
@@ -205,7 +205,8 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
                   << std::endl;
       }
       if (true) { //python_state_enable) {
-        python_state_report();
+        // python_state_report();
+        torch_monitor_python_state_get(MAX_NUM_STATES, python_states, &num_states);
       }
       if (torch_monitor_inputs_capture_enable_get()) {
         /**
@@ -215,6 +216,13 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
           if (iter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
             std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
             analysis_ptr->_op_stack.push(callback_data->data.op_data);
+            for (int64_t i = 0 ; i < callback_data->data.op_data.input_output_data.size; i++) {
+              torch_monitor_callback_tensor_data_t titer = callback_data->data.op_data.input_output_data.tensor_data[i];
+              if (titer.index == -1 || titer.numel <= 0)
+                continue;
+              u64 op_id = update_op_id_func();
+              analysis_ptr->update_view_forest(titer, op_id);  // update the view forest
+            }
           }
         }  // ends stack operation
         torch_callback_inputs_outputs_report(callback_site, callback_data);
@@ -233,12 +241,13 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
         for (auto iter : analysis_enabled){
           if (iter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
             std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
-            analysis_ptr->delete_forest_tree((redshow::TorchView::data_ptr_t)callback_data->data.mem_data.ptr);
-#ifdef DEBUG
-            for (auto titer : analysis_ptr->_roots){
-              analysis_ptr->visualize_view_forest(titer);
-            }
-#endif
+            analysis_ptr->delete_forest_tree((redshow::TorchView::data_ptr_t)callback_data->data.mem_data.ptr,
+                                             (int64_t)callback_data->data.mem_data.total_allocated);
+//#ifdef DEBUG
+//            for (auto titer : analysis_ptr->_roots){
+//              analysis_ptr->visualize_view_forest(titer);
+//            }
+//#endif
           }
         }  // ends removing
       }
@@ -284,7 +293,8 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
               torch_monitor_callback_tensor_data_t titer = callback_data->data.op_data.input_output_data.tensor_data[i];
               if (titer.index == -1 || titer.numel <= 0)
                 continue;
-              analysis_ptr->update_view_forest(titer);  // update the view forest
+              u64 op_id = update_op_id_func();
+              analysis_ptr->update_view_forest(titer, op_id);  // update the view forest
             }
             analysis_ptr->_op_stack.pop();
           }

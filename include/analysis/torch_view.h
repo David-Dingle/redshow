@@ -1,9 +1,11 @@
 //
 // Created by xjding on 1/1/24.
 // TODO(XJDing):
-//  is callback func mutax needed?
-//  where comes the double free (!prev) error?
-//  C/CUDA Call path; Early stop for tensor strides sorting with the aid of transpose flag; GPA; Debugging
+//  is callback func mutax needed? (Done)
+//  where comes the double free (!prev) error? (disappeared)
+//  C/CUDA Call path;
+//  Early stop for tensor strides sorting with the aid of transpose flag;
+//  GPA;
 //
 
 #ifndef REDSHOW_ANALYSIS_TORCH_VIEW_H
@@ -26,13 +28,14 @@
 #include "operation/operation.h"
 #include "redshow.h"
 #include <iostream>
+#include <algorithm>
 
 #include "/home/xjding/Projects/new_DrGPUM/DrGPUM/torch-monitor/include/torch_monitor.h"
 
 #include <fstream>
 
 const static size_t MAX_NUM_STATES = 30;
-
+thread_local static size_t num_states;
 thread_local static torch_monitor_python_state_t python_states[MAX_NUM_STATES];
 
 namespace redshow {
@@ -76,6 +79,7 @@ namespace redshow {
    typedef std::pair<data_ptr_t, data_ptr_t> mem_range_t;
 
    struct ViewNode {
+     u64 view_id;
      int64_t index;
      int64_t numel;  // number of tensor elements
      int64_t dim;
@@ -92,12 +96,12 @@ namespace redshow {
 
      public:
        /**temp object for searching*/
-      ViewNode(data_ptr_t data_ptr, metadata_ptr_t metadata_ptr):data_ptr(data_ptr), metadata_ptr(metadata_ptr) {}
+      ViewNode(data_ptr_t data_ptr, metadata_ptr_t metadata_ptr, int64_t numel, uint64_t itemsize):data_ptr(data_ptr), metadata_ptr(metadata_ptr), numel(numel), itemsize(itemsize) {}
 
       /**for root nodes*/
-      ViewNode(int64_t index, int64_t numel, int64_t dim, torch_monitor_scalar_type_t dtype, uint64_t itemsize, int64_t storage_offset,
+      ViewNode(u64 view_id, int64_t index, int64_t numel, int64_t dim, torch_monitor_scalar_type_t dtype, uint64_t itemsize, int64_t storage_offset,
                int64_t sizes[], int64_t strides[], data_ptr_t data_ptr, metadata_ptr_t metadata_ptr):
-               index(index), numel(numel), dim(dim), dtype(dtype), itemsize(itemsize), storage_offset(storage_offset), data_ptr(data_ptr),
+               view_id(view_id), index(index), numel(numel), dim(dim), dtype(dtype), itemsize(itemsize), storage_offset(storage_offset), data_ptr(data_ptr),
                metadata_ptr(metadata_ptr){
         for(int i = 0; i < std::min<int>(TORCH_MONITOR_MAX_TENSOR_DIMENSION, dim); i ++){
           this->sizes[i] = sizes[i];
@@ -107,10 +111,10 @@ namespace redshow {
       }
 
       /**other nodes*/
-      ViewNode(int64_t index, int64_t numel, int64_t dim, torch_monitor_scalar_type_t dtype, uint64_t itemsize, int64_t storage_offset,
+      ViewNode(u64 view_id, int64_t index, int64_t numel, int64_t dim, torch_monitor_scalar_type_t dtype, uint64_t itemsize, int64_t storage_offset,
                int64_t sizes[], int64_t strides[], data_ptr_t data_ptr, metadata_ptr_t metadata_ptr,
                mem_range_t mem_block_range):
-               index(index), numel(numel), dim(dim), dtype(dtype), itemsize(itemsize), storage_offset(storage_offset), data_ptr(data_ptr),
+               view_id(view_id), index(index), numel(numel), dim(dim), dtype(dtype), itemsize(itemsize), storage_offset(storage_offset), data_ptr(data_ptr),
                metadata_ptr(metadata_ptr){
         this->mem_block_range = mem_range_t{mem_block_range};
         for(int i = 0; i < std::min<int>(TORCH_MONITOR_MAX_TENSOR_DIMENSION, dim); i ++){
@@ -119,9 +123,9 @@ namespace redshow {
         }
       }
 
-      ~ViewNode(){
-        std::cout<< "destruct: " << (uint64_t)this->data_ptr << std::endl;
-      }
+//      ~ViewNode(){
+//        std::cout<< "destruct: " << (uint64_t)this->data_ptr << std::endl;
+//      }
 
       bool operator==(const ViewNode& r_val) {
         return ((this->data_ptr == r_val.data_ptr) && (this->metadata_ptr == r_val.metadata_ptr));
@@ -132,7 +136,7 @@ namespace redshow {
        * return node ptr if the view sits on this branch
        * return null if the view sits nowhere on this branch
        * */
-      ViewNode* find_node(ViewNode r_node) {
+      ViewNode* find_node(ViewNode& r_node) {
         if (*(this) == r_node) {
           return this;
         }
@@ -165,19 +169,38 @@ namespace redshow {
       }
    };
 
-   std::vector<ViewNode*> _roots = {};  // The node forest //TODO: optimize
-
-   std::vector<mem_range_t> gpu_mem_blocks = {};
-
-   // push <op_name, visible inputs(tensors)> while domain enter
-   // pop op_name while domain exit
    std::stack<torch_monitor_op_data_t> _op_stack = std::stack<torch_monitor_op_data_t>();
-   torch_monitor_op_data_t _popped_op = torch_monitor_op_data_t();
+   std::stack<torch_monitor_op_data_t> _op_stack_temp = std::stack<torch_monitor_op_data_t>();  // Deprecated
+   torch_monitor_op_data_t _popped_op; // = torch_monitor_op_data_t();
+
+   struct PyStateCTX {
+    public:
+     int64_t index;  // arg index in torch-monitor callback inputs list
+     size_t num_states;
+     torch_monitor_python_state_t py_state[MAX_NUM_STATES];
+     std::vector<u64> ctx_id;
+
+     PyStateCTX(int64_t index, size_t num_states, torch_monitor_python_state_t (&arg_py_state)[MAX_NUM_STATES]):
+       index(index), num_states(num_states)
+     {
+       ctx_id = std::vector<u64>{};  // init as empty vector
+       for (int i = 0; i < (num_states < MAX_NUM_STATES ? num_states : MAX_NUM_STATES); i++){
+         py_state[i].file_name = arg_py_state[i].file_name;
+         py_state[i].function_name = arg_py_state[i].function_name;
+         py_state[i].function_first_lineno = arg_py_state[i].function_first_lineno;
+         py_state[i].lineno = arg_py_state[i].lineno;
+       } // TODO(Ding): Verify the correctness of shallow copy
+     };
+   };
+
+   std::vector<ViewNode*> _roots = {};  // The node forest //TODO: optimize
+   std::map<u64, std::vector<PyStateCTX>> call_path_map = {};
+   std::vector<mem_range_t> gpu_mem_blocks = {};
 
    /** find view root from the forest */
    ViewNode* find_root_node(ViewNode r_node) {
      for (auto node : _roots){
-       if (r_node.data_ptr >= node->mem_block_range.first && r_node.data_ptr <= node->mem_block_range.second){
+       if (r_node.data_ptr >= node->mem_block_range.first && (r_node.data_ptr + r_node.itemsize * r_node.numel) <= node->mem_block_range.second){
          return node;
        }
      }
@@ -193,17 +216,19 @@ namespace redshow {
    *    1.2. in the branch: do nothing here. _total_access will be added by elsewhere when (mem_rw/view_offset) is captured. (TODO)
    * 2. else, create a root node
    * */
-   void update_view_forest(torch_monitor_callback_tensor_data_t& tensor_data) {
+   void update_view_forest(torch_monitor_callback_tensor_data_t& tensor_data, u64 global_id) {
      lock();
 
      data_ptr_t data_ptr = (data_ptr_t)tensor_data.data_ptr;
      metadata_ptr_t metadata_ptr = (metadata_ptr_t)tensor_data.metadata_ptr;
-     ViewNode temp = ViewNode{data_ptr, metadata_ptr};
-    ViewNode* root_found = find_root_node(temp);
+     ViewNode temp = ViewNode{data_ptr, metadata_ptr, tensor_data.numel, tensor_data.itemsize};
+     ViewNode* root_found = find_root_node(temp);
      if(root_found){
        ViewNode* view_existed = root_found->find_node(temp);
-       if(view_existed){ // update _total_access counter
-         view_existed->_total_access++;
+       if(view_existed){
+         // Update Python State
+         PyStateCTX _state{tensor_data.index, num_states, python_states};
+         call_path_map[view_existed->view_id].push_back(_state);
        } else { // found the view node in the forest
          /** insert new view node into correct "view_node._children"
            * 1. find the father node from the root/branch
@@ -216,26 +241,32 @@ namespace redshow {
              continue;
            data_ptr_t _tensor_data_ptr = (data_ptr_t)_tensor.data_ptr;
            metadata_ptr_t _tensor_metadata_ptr = (metadata_ptr_t)_tensor.metadata_ptr;
-           ViewNode _input_temp = ViewNode{_tensor_data_ptr, _tensor_metadata_ptr};
+           ViewNode _input_temp = ViewNode{_tensor_data_ptr, _tensor_metadata_ptr, _tensor.numel, _tensor.itemsize};
            ViewNode* _input_root = root_found; //find_root_node(_input_temp);
            ViewNode* _input_view = _input_root->find_node(_input_temp);
            if (!_input_view) // if the candidate father does not exist ; continue and look on the next one
              continue;
            if ((data_ptr_t)tensor_data.data_ptr >= _input_view->mem_block_range.first && (data_ptr_t)tensor_data.data_ptr <= _input_view->mem_block_range.second) {
              // add the tensor_data to _tensor(node)'s children
-             ViewNode* _node = new ViewNode(tensor_data.index, tensor_data.numel, tensor_data.dim, tensor_data.dtype, tensor_data.itemsize,
+             ViewNode* _node = new ViewNode(global_id, tensor_data.index, tensor_data.numel, tensor_data.dim, tensor_data.dtype, tensor_data.itemsize,
                                                                           tensor_data.storage_offset, tensor_data.sizes, tensor_data.strides, data_ptr,
                                                                           metadata_ptr, _input_view->mem_block_range);
              _input_view->_children.push_back(_node);
+             call_path_map[global_id] = std::vector<PyStateCTX>();
+             PyStateCTX _state{tensor_data.index, num_states, python_states};
+             call_path_map[global_id].push_back(_state);
              break;
            }
          }
        }
      } else { // add a new root
-       ViewNode* _root_node_ptr = new ViewNode(tensor_data.index, tensor_data.numel, tensor_data.dim, tensor_data.dtype, tensor_data.itemsize,
+       ViewNode* _root_node_ptr = new ViewNode(global_id, tensor_data.index, tensor_data.numel, tensor_data.dim, tensor_data.dtype, tensor_data.itemsize,
                                                                                tensor_data.storage_offset, tensor_data.sizes, tensor_data.strides, data_ptr,
                                                                                metadata_ptr);
        _roots.push_back(_root_node_ptr);
+       call_path_map[global_id] = std::vector<PyStateCTX>();
+       PyStateCTX _state{tensor_data.index, num_states, python_states};
+       call_path_map[global_id].push_back(_state);
      } // add a new root
      unlock();
    }
@@ -247,7 +278,7 @@ namespace redshow {
    void visualize_view_forest(ViewNode* root, int indent_level = 0, const char* indent = "    |"){
      for (int i = 0; i < indent_level; i++)
        std::cout << indent;
-     std::cout << "D_ptr: " << root->data_ptr << " M_ptr: " << root->metadata_ptr << " Range_f: " << root->mem_block_range.first << " Range_s: " << root->mem_block_range.second << " Access: " << root->_total_access;
+     std::cout << "ID: " << root->view_id << " D_ptr: " << root->data_ptr << " numel: " << root->numel << " dim: " << root->dim << " M_ptr: " << root->metadata_ptr << " Range_f: " << root->mem_block_range.first << " Range_s: " << root->mem_block_range.second << " Access: " << root->_total_access;
      if (!root->_children.empty()){
        for (ViewNode* citer : root->_children) {
          visualize_view_forest(citer, indent_level + 1, indent);
@@ -262,10 +293,10 @@ namespace redshow {
     * delete a tree(gaven a tensor ptr) from the forest
     *@param mem_start_addr: starting address of memory range
     */
-   void delete_forest_tree(data_ptr_t mem_start_addr) {
+   void delete_forest_tree(data_ptr_t mem_start_addr, int64_t total_allocated) {
      lock();
-     for (int i =0; i < _roots.size(); i++) {
-       if (_roots.at(i)->mem_block_range.first == mem_start_addr){
+     for (unsigned i = 0; i < _roots.size(); i++) {
+       if (_roots.at(i)->mem_block_range.first >= mem_start_addr && _roots.at(i)->mem_block_range.second <= (mem_start_addr + total_allocated)){
          _roots.at(i)->delete_children_nodes();
          _roots.erase(_roots.begin()+i);
          break;
@@ -279,14 +310,17 @@ namespace redshow {
     * @param a list of view_nodes
     * TODO: call this func at project stage 3, (use data_ptr, offset, stride, itemsize to spot the view_node which needs update)
     */
-   void update_node__total_access(std::vector<ViewNode*> view_nodes) {
-     lock();
+   void update_node_total_access(std::vector<ViewNode*> view_nodes) {
+     // lock(); // TODO: Try fix later: another lock; Or try to make it sequential
      for (auto viter : view_nodes) {
        ViewNode* _root_node = find_root_node(*viter);
+       if (!_root_node) {
+         continue;
+       }
        ViewNode* _node = _root_node->find_node(*viter);
        _node->_total_access++;
      }
-     unlock();
+     // unlock();
    }
 
    /**
@@ -390,13 +424,22 @@ namespace redshow {
      torch_monitor_input_output_data_t inputs = op_info.input_output_data;
      for (int64_t i = 0; i < inputs.size; i++) {
        torch_monitor_callback_tensor_data_t _tensor = inputs.tensor_data[i];
+       std::cout << "op stack tensor data ptr: " << (u64)_tensor.data_ptr << std::endl;
        if (_tensor.index == -1 || _tensor.numel <= 0)
          continue;
        data_ptr_t _tensor_data_ptr = reinterpret_cast<data_ptr_t>(_tensor.data_ptr);
        metadata_ptr_t _tensor_metadata_ptr = reinterpret_cast<metadata_ptr_t>(_tensor.metadata_ptr);
-       ViewNode _input_temp = ViewNode{_tensor_data_ptr, _tensor_metadata_ptr};
+       ViewNode _input_temp = ViewNode{_tensor_data_ptr, _tensor_metadata_ptr, _tensor.numel, _tensor.itemsize};
        ViewNode* _input_root = find_root_node(_input_temp);
+       if (!_input_root) {
+//         std::cout << "No root---" << std::endl;
+         continue;
+       }
        ViewNode* _input_view = _input_root->find_node(_input_temp);
+       if (!_input_view) {
+//         std::cout << "No node---" << std::endl;
+         continue;
+       }
        // possible: hit-address roughly fall into view_node.mem_block_range
        if ((data_ptr_t)mem_addr_hit >= _input_view->mem_block_range.first && (data_ptr_t)mem_addr_hit <= _input_view->mem_block_range.second) {
          possible.push_back(_tensor);
@@ -411,9 +454,12 @@ namespace redshow {
        uint64_t itemsize = sorted[i].itemsize;
        u64 sit = find_closest_starting_address(sorted[i], itemsize, mem_addr_hit);
        if(sit != 0){
-         if((mem_addr_hit - sit) / (sorted[i].strides[sorted[i].dim - 1] * itemsize) < sorted[i].sizes[sorted[i].dim - 1]
-           &&
-           (mem_addr_hit - sit) % (sorted[i].strides[sorted[i].dim - 1] * itemsize) == 0){
+//         if((mem_addr_hit - sit) / (sorted[i].strides[sorted[i].dim - 1] * itemsize) < sorted[i].sizes[sorted[i].dim - 1]
+           if((mem_addr_hit == sit)
+             ||
+               ((mem_addr_hit - sit) < sorted[i].sizes[sorted[i].dim - 1] * (sorted[i].strides[sorted[i].dim - 1] * itemsize)
+               &&
+               (mem_addr_hit - sit) % (sorted[i].strides[sorted[i].dim - 1] * itemsize) == 0)){
            hit.push_back(sorted[i]);
          }
        }
@@ -422,11 +468,14 @@ namespace redshow {
      for(int64_t i = 0; i < hit.size(); i++){
        data_ptr_t _hit_data_ptr = reinterpret_cast<data_ptr_t>(hit[i].data_ptr);
        metadata_ptr_t _hit_metadata_ptr = reinterpret_cast<metadata_ptr_t>(hit[i].metadata_ptr);
-       ViewNode _input_temp = ViewNode{_hit_data_ptr, _hit_metadata_ptr};
+       ViewNode _input_temp = ViewNode{_hit_data_ptr, _hit_metadata_ptr, hit[i].numel, hit[i].itemsize};
        ViewNode* _input_root = find_root_node(_input_temp);
        ViewNode* _input_view = _input_root->find_node(_input_temp);
        res.push_back(_input_view);
      }
+     std::cout << "possible size: " << possible.size() << std::endl;
+     std::cout << "sorted size: " << sorted.size() << std::endl;
+     std::cout << "hit size: " << hit.size() << std::endl;
      return res;
    }
 
@@ -434,12 +483,9 @@ namespace redshow {
    struct TorchViewTrace final : public Trace {
      // only need to know memory access, don't care read or write
      // here use memory range to loge access range but not allocation and sub-allocation
-
      // u64: Memory:Operation->op_id
-     // @Lin-Mao: don't care about read or write in this mode, just need to know access or not
-     Map<u64, bool> access_memory; // map with sort but vector not
-
-     Map<u64, bool> access_submemory;
+     // don't care about read or write in this mode, just need to know access or not
+     Map<u64, i32> access_memory; // map with sort but vector not
 
      TorchViewTrace() = default;
 

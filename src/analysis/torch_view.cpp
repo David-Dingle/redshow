@@ -18,10 +18,10 @@
 namespace redshow {
 
   void TorchView::update_op_node(u64 op_id, i32 ctx_id) {
-    if (op_id > REDSHOW_MEMORY_HOST) {
-      // Point the operation to the calling context
-      _op_node[op_id] = ctx_id;
-    }
+//    if (op_id > REDSHOW_MEMORY_HOST) {
+//      // Point the operation to the calling context
+//      _op_node[op_id] = ctx_id;
+//    }
   }
 
   void TorchView::op_callback(OperationPtr op, bool is_submemory /* default = false */) {
@@ -42,189 +42,133 @@ namespace redshow {
   }
 
   void TorchView::memory_op_callback(std::shared_ptr<Memory> op, bool is_submemory) {
-//    update_op_node(op->op_id, op->ctx_id);
+    /**
+     * Pass
+     * In theory, we don't care about CUDA memory allocation
+     * May empty this code block later
+     */
+//    _memories.try_emplace(op->op_id, op);
+//    _current_memories.try_emplace(op->op_id, op);
+//    _op_node.emplace(op->op_id, op->ctx_id);
+//    _op_type.emplace(op->op_id, "ALLOC");
 //
-//    if (!is_submemory) {
-//      _memories.try_emplace(op->op_id, op);
-//      _current_memories.try_emplace(op->op_id, op);
-//      _op_node.emplace(op->op_id, op->ctx_id);
-//      _op_type.emplace(op->op_id, "ALLOC");
-//
-//      _addresses_map.try_emplace(op->memory_range.start, op->op_id);
-//      _current_memory_usage += op->len;
-//      _nums_cudamalloc++;
-//
-//      if (_current_memory_usage > _memory_peak)
-//        _memory_peak = _current_memory_usage;
-//    } else {
-//      _submemories.try_emplace(op->op_id, op);
-//      _current_submemories.try_emplace(op->op_id, op);
-//      _sub_addresses_map.try_emplace(op->memory_range.start, op->op_id);
-//      _current_submemory_usage += op->len;
-//
-//      if (_current_submemory_usage > _submemory_peak) {
-//        _submemory_peak = _current_submemory_usage;
-//      }
-//    }
+//    _addresses_map.try_emplace(op->memory_range.start, op->op_id);
+//    _nums_cudamalloc++;
   }
 
-  /**
-   *
-   * */
   void TorchView::memfree_op_callback(std::shared_ptr<Memfree> op, bool is_submemory) {
-  // update_global_op_id_start(op->op_id);
-//  update_op_node(op->op_id, op->ctx_id);
-//
-//  if (!is_submemory) {
+    /**
+     * Pass
+     * We don't care about CUDA level memory free operations
+     * May empty this code block later
+     */
 //    u64 address = op->memory_range.start;
 //    u64 malloc_op_id = _addresses_map.at(address);
 //    _op_node.emplace(op->op_id, op->ctx_id);
 //    _op_type.emplace(op->op_id, "FREE");
-//
 //    _addresses_map.erase(address);
 //    _current_memories.erase(malloc_op_id);
 //    _current_memory_usage -= op->len;
 //    _nums_cudafree++;
-//
-//  } else {
-//    u64 address = op->memory_range.start;
-//    u64 sub_alloc_id = _sub_addresses_map.at(address);
-//
-//    _sub_addresses_map.erase(address);
-//    _current_submemories.erase(sub_alloc_id);
-//    _current_submemory_usage -= op->len;
-//  }
-}
+  }
 
 /**
  * Need fix
  * */
   void TorchView::kernel_op_callback(std::shared_ptr<Kernel> op) {
+    std::cout << "Enter TORCH_VIEW Kernel op callback." << std::endl;
+    if (_trace.get() == NULL) {
+      // If the kernel is sampled
+      return;
+    }
+    std::cout << "We Got " <<  _trace->access_memory.size() << " memory accesses." << std::endl;
+    for (auto &trace_iter : _trace->access_memory) {
+      u64 mem_start = trace_iter.first;
+      std::vector<ViewNode*> view_node_hit_mem = get_view_nodes_by_mem_addr(mem_start);
 
-//    update_op_node(op->op_id, op->ctx_id);
-//
-//    if (_trace.get() == NULL) {
-//      // If the kernel is sampled
-//      return;
-//    }
-//
-//    Map<u64, Set<MemoryRange>> initail_unuse_memory_map;
-//    _blank_chunks.emplace(_trace->kernel.op_id, initail_unuse_memory_map);
-//
-//    auto &unuse_memory_map_in_kernel = _blank_chunks[_trace->kernel.op_id];
-//
-//    // for access trace, no need to identify read or write
-//    for (auto &mem_iter : _trace->access_memory) {
-//
-//#ifdef SUB_MEMORY
-//      auto memory = _sub_memories.at(mem_iter.first);
-//#endif
-//
-//#ifndef SUB_MEMORY
-//      auto memory = _memories.at(mem_iter.first);
-//#endif
-//      if (_accessed_memories.find(mem_iter.first) != _accessed_memories.end()) {
-//        auto kid = _accessed_memories.at(mem_iter.first);
-//        auto mem_unuse_set = _blank_chunks.at(kid).at(mem_iter.first);
-//        unuse_memory_map_in_kernel.emplace(mem_iter.first, mem_unuse_set);
-//        // ensure the lastest mem_unuse_set
-//        _accessed_memories[mem_iter.first] = _trace->kernel.op_id;
-//      } else {
-//        _accessed_memories.emplace(mem_iter.first, _trace->kernel.op_id);
-//        Set<MemoryRange> mem_unuse_set;
-//        mem_unuse_set.insert(memory->memory_range);
-//        unuse_memory_map_in_kernel.emplace(mem_iter.first, mem_unuse_set);
+//      if (view_node_hit_mem.size() == 0) {
+//        bool flag = true;
+//        while(flag){
+//          std::cout<< "happy."<<std::endl;
+//        }
 //      }
-//
-//      auto node_id = _op_node.at(memory->op_id);
-//
-//      int r_count = 0; // for debug count
-//      // mem_iter.second is a Set<MemRange>
-//      for (auto &range_iter : mem_iter.second) {
-//        update_blank_chunks(op->op_id, mem_iter.first, range_iter);
+
+//      if (view_node_hit_mem.size() == 0) {
+//        for (; view_node_hit_mem.size() == 0 && _op_stack.size( )>= 2;) {
+//          _op_stack_temp.push(_op_stack.top());
+//          _op_stack.pop();
+//          view_node_hit_mem = get_view_nodes_by_mem_addr(mem_start);
+//        }
+//        for(; !_op_stack_temp.empty(); ) {
+//          _op_stack.push(_op_stack_temp.top());
+//          _op_stack_temp.pop();
+//        }
 //      }
-//    }
-//    update_object_fragmentation_per_kernel(_trace->kernel.cpu_thread, op->op_id);
-//
-//    // reset _trace
-//    _trace->access_memory.clear();
-//    _trace = NULL;
+      update_node_total_access(view_node_hit_mem);
+      // Update Call ctc_id to CallPath
+      for (auto viter = view_node_hit_mem.begin(); viter != view_node_hit_mem.end(); viter++){
+        call_path_map[(*viter)->view_id].back().ctx_id.push_back(_trace->access_memory[mem_start]);
+      }
+      std::cout << "Kernel Access Hits: " << view_node_hit_mem.size() << " View Node(s). :: " << mem_start << std::endl;
+    }
+    _trace->access_memory.clear();
+    _trace = NULL;
   }
 
   void TorchView::memcpy_op_callback(std::shared_ptr<Memcpy> op) {
-//    auto overwrite = op->len;
-//    auto src_memory = _memories.at(op->src_memory_op_id);
-//    auto dst_memory = _memories.at(op->dst_memory_op_id);
-//    auto src_len = src_memory->len == 0 ? op->len : src_memory->len;
-//    auto dst_len = dst_memory->len == 0 ? op->len : dst_memory->len;
-//
-//    if (op->dst_memory_op_id == REDSHOW_MEMORY_HOST || op->dst_memory_op_id == REDSHOW_MEMORY_UVM) {
-//      // sink edge
-//      auto dst_ctx_id = _op_node.at(op->dst_memory_op_id);
-//
-//    } else {
-//      link_op_node(op->dst_memory_op_id, op->ctx_id, dst_memory->ctx_id);
-//      update_op_node(op->dst_memory_op_id, op->ctx_id);
-//    }
-//
-//    auto src_ctx_id = _op_node.at(op->src_memory_op_id);
-//    auto dst_ctx_id = _op_node.at(op->dst_memory_op_id);
-//
-//    // Update host
-//    memory_copy(reinterpret_cast<void *>(op->dst_shadow_start), reinterpret_cast<void *>(op->src_shadow_start),
-//                op->len);
-//    u64 host = 0;
-//    if (op->dst_memory_op_id == REDSHOW_MEMORY_HOST || op->dst_memory_op_id == REDSHOW_MEMORY_UVM) {
-//      host = op->dst_shadow_start;
-//    } else {
-//      host = reinterpret_cast<u64>(dst_memory->value.get());
-//    }
-//
-//#ifdef NDEBUG_TORCH_VIEW
-//      std::cout << "ctx: " << op->ctx_id << ", hash: " << hash
-//      << " overwrite, " << overwrite << ", memory->len: " << dst_len << std::endl;
-//#endif
+    if ((op->dst_memory_op_id != REDSHOW_MEMORY_HOST && op->dst_memory_op_id != REDSHOW_MEMORY_UVM) // im case dst on device
+         ||
+        (op->src_memory_op_id != REDSHOW_MEMORY_HOST && op->src_memory_op_id != REDSHOW_MEMORY_UVM)) { // in case src on device
+      // auto dst_ctx_id = _op_node.at(op->dst_memory_op_id);
+      u64 overwrite_len = op->len;
+      u64 src_start = op->src_start;
+      u64 dst_start = op->dst_start;
+      u64 dst_shadow_start = op->dst_shadow_start;
+
+      // (mem_range_t)mem_range{mem_addrs, mem_addrs + op->len};
+      std::vector<ViewNode*> view_node_hit_src = get_view_nodes_by_mem_addr(src_start);
+      std::vector<ViewNode*> view_node_hit_dst = get_view_nodes_by_mem_addr(dst_start);
+      std::vector<ViewNode*> view_node_hit_shadow = get_view_nodes_by_mem_addr(dst_shadow_start);
+
+      std::cout << "memcpy hit: " << view_node_hit_src.size() << " " <<
+                                     view_node_hit_dst.size() << " " <<
+                                     view_node_hit_shadow.size() << " view nodes." << std::endl;
+      update_node_total_access(view_node_hit_src);
+      update_node_total_access(view_node_hit_dst);
+      update_node_total_access(view_node_hit_shadow);
+    }
   }
 
   void TorchView::memset_op_callback(std::shared_ptr<Memset> op) {
-//    u64 overwrite = op->len;
-//
-//    auto memory = _memories.at(op->memory_op_id);
-//    link_op_node(op->memory_op_id, op->ctx_id, memory->ctx_id);
-//    update_op_node(op->memory_op_id, op->ctx_id);
-//
-//    // Update host
-//    memset(reinterpret_cast<void *>(op->shadow_start), op->value, op->len);
-//    u64 host = reinterpret_cast<u64>(memory->value.get());
-//
-//    if (_configs[REDSHOW_ANALYSIS_DATA_FLOW_HASH] == true) {
-//      std::string hash = compute_memory_hash(host, memory->len);
-//      _node_hash[op->ctx_id].emplace(hash);
-//
-//#ifdef DEBUG_DATA_FLOW
-//      std::cout << "ctx: " << op->ctx_id << ", hash: " << hash
-//      << " overwrite, " << overwrite << ", memory->len: " << memory->len << std::endl;
-//#endif
-//    }
+    if (op->memory_op_id != REDSHOW_MEMORY_HOST && op->memory_op_id != REDSHOW_MEMORY_UVM) {
+      u64 overwrite = op->len;
+      u64 start = op->start;
+      u64 dst_shadow_start = op->shadow_start;
+      u64 value = op->value;
+
+      std::vector<ViewNode*> view_node_hit_start = get_view_nodes_by_mem_addr(start);
+      std::vector<ViewNode*> view_node_hit_shadow = get_view_nodes_by_mem_addr(dst_shadow_start);
+
+      std::cout << "memset hit: " << view_node_hit_start.size() << " " <<
+                                     view_node_hit_shadow.size() << " view nodes." << std::endl;
+      update_node_total_access(view_node_hit_start);
+      update_node_total_access(view_node_hit_shadow);
+    }
   }
 
   void TorchView::analysis_begin(u32 cpu_thread, i32 kernel_id, u64 host_op_id, u32 stream_id,
                                 u32 cubin_id, u32 mod_id, GPUPatchType type, void* trace_data) {
-//    assert(type == GPU_PATCH_TYPE_ADDRESS_PATCH || type == GPU_PATCH_TYPE_ADDRESS_ANALYSIS);
-//
-//    lock();
-//
-//    if (!this->_kernel_trace[cpu_thread].has(host_op_id)) {
-//      auto trace = std::make_shared<MemoryProfileTrace>();
-//      trace->kernel.ctx_id = kernel_id;
-//      trace->kernel.cubin_id = cubin_id;
-//      trace->kernel.mod_id = mod_id;
-//      trace->kernel.op_id = host_op_id;
-//      this->_kernel_trace[cpu_thread][host_op_id] = trace;
-//    }
-//    _trace = std::dynamic_pointer_cast<MemoryProfileTrace>(this->_kernel_trace[cpu_thread][host_op_id]);
-//
-//    unlock();
+    // configured in sanitizer-api.c:sanitizer_torch_view_analysis_enable()
+//    if(type == GPU_PATCH_TYPE_ADDRESS_ANALYSIS)
+//      return;
+    assert(type == GPU_PATCH_TYPE_ADDRESS_PATCH || type == GPU_PATCH_TYPE_ADDRESS_ANALYSIS);
+    // gpu_patch_buffer_t* buffer = static_cast<gpu_patch_buffer_t*>(trace_data);
+    lock();
+    // ?? How to make sure this _trace are the same with the _trace in kernel_op_callback
+    if (!_trace) {
+      _trace = std::make_shared<TorchViewTrace>();
+    }
+    unlock();
   }
 
   void TorchView::analysis_end(u32 cpu_thread, i32 kernel_id) {}
@@ -240,6 +184,25 @@ namespace redshow {
   void TorchView::unit_access(i32 kernel_id, u64 host_op_id, const ThreadId &thread_id,
                                  const AccessKind &access_kind, const Memory &memory, u64 pc,
                                  u64 value, u64 addr, u32 index, GPUPatchFlags flags) {
+//    if (memory.op_id >= REDSHOW_MEMORY_UVM) {
+//      return;
+//    }
+//    auto &memory_range = memory.memory_range;
+//    if (flags & GPU_PATCH_READ) {
+//      if (_configs[REDSHOW_ANALYSIS_READ_TRACE_IGNORE] == false) {
+//        merge_memory_range(_trace->read_memory[memory.op_id], memory_range);
+//      } else if (_trace->read_memory[memory.op_id].empty()) {
+//        _trace->read_memory[memory.op_id].insert(memory_range);
+//      }
+//    }
+//    if (flags & GPU_PATCH_WRITE) {
+//      merge_memory_range(_trace->write_memory[memory.op_id], memory_range);
+//    }
+    std::cout << "ENTER TORCH VIEW UNIT ACCESS: " << memory.memory_range.start << std::endl;
+    if (!_trace->access_memory.has(memory.memory_range.start)) {
+      _trace->access_memory.emplace(memory.memory_range.start, memory.ctx_id);
+      std::cout << "Trace mem size: " << _trace->access_memory.size() << std::endl;
+    }
   }
 
   void TorchView::flush_thread(u32 cpu_thread, const std::string &output_dir,
@@ -247,26 +210,6 @@ namespace redshow {
                                   redshow_record_data_callback_func record_data_callback) {}
 
   void TorchView::flush(const std::string &output_dir, const LockableMap<u32, Cubin> &cubins,
-                           redshow_record_data_callback_func record_data_callback) {
-//    std::ofstream output(output_dir + "memory_info.txt");
-//    output << "GPU memory peak: " << _memory_peak << " B" << std::endl;
-//    output << "Optimal GPU memory peak: " << _optimal_memory_peak << " B" << std::endl;
-//    output << "Peak kernel op id: " << _memory_peak_kernel << std::endl;
-//    output << "Number of cudaMallocs: " << _nums_cudamalloc << std::endl;
-//    output << "Number of cudaFrees: " << _nums_cudafree << std::endl;
-//    output << std::endl;
-//
-//    output << "Submemory peak: " << _submemory_peak << " B" << std::endl;
-//    output << "Optimal submemory peak: " << _optimal_submemory_peak << " B" << std::endl;
-//    output << "Peak kernel op id: " << _submemory_peak_kernel << std::endl;
-//
-//    output.close();
-//
-//    std::ofstream out(output_dir + "memory_info.csv");
-//    for (auto op : _op_node) {
-//      out << "op_id: " << op.first << ", " << _op_type[op.first] << " " << op.second << std::endl;
-//    }
-//    out.close();
-  }
+                           redshow_record_data_callback_func record_data_callback) {}
 
 }  // namespace redshow
