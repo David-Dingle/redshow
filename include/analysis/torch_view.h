@@ -4,6 +4,7 @@
 //  is callback func mutax needed? (Done)
 //  where comes the double free (!prev) error? (disappeared)
 //  C/CUDA Call path;
+//  How to use hpcprof https://github.com/Lin-Mao/hpctoolkit/commits/main/src/tool/hpcprof
 //  Early stop for tensor strides sorting with the aid of transpose flag;
 //  GPA;
 //
@@ -77,6 +78,49 @@ namespace redshow {
    typedef u64 data_ptr_t;
    typedef u64 metadata_ptr_t;
    typedef std::pair<data_ptr_t, data_ptr_t> mem_range_t;
+
+   struct MemoryBlock {
+     u64 block_id;
+     torch_monitor_device_type_t device_type;
+     data_ptr_t ptr;
+     int64_t size;
+     int64_t total_allocated;
+     int64_t total_reserved;
+
+    public:
+     MemoryBlock(u64 block_id, torch_monitor_device_type_t device_type, data_ptr_t ptr, int64_t size, int64_t total_allocated, int64_t total_reserved):
+                 block_id(block_id), device_type(device_type), ptr(ptr), size(size), total_allocated(total_allocated), total_reserved(total_reserved){}
+   };
+
+   std::vector<MemoryBlock*> _allocated_mem_blocks = {};
+
+   void register_memory_block(u64 block_id, torch_monitor_device_type_t device_type, void* ptr, int64_t size, int64_t total_allocated, int64_t total_reserved){
+     MemoryBlock* _memory_block = new MemoryBlock(block_id, device_type, reinterpret_cast<data_ptr_t>(ptr), size, total_allocated, total_reserved);
+     _allocated_mem_blocks.push_back(_memory_block);
+     std::cout << "Total Blocks after registration: " << _allocated_mem_blocks.size() << std::endl;
+   }
+
+   void unregister_memory_block(void* ptr){
+     for (auto miter = _allocated_mem_blocks.begin(); miter != _allocated_mem_blocks.end(); miter++){
+       if((*miter)->ptr == reinterpret_cast<data_ptr_t>(ptr)) {
+         delete (*miter);
+         _allocated_mem_blocks.erase(miter);
+         break;
+       }
+     }
+     std::cout << "Total Blocks after free: " << _allocated_mem_blocks.size() << std::endl;
+   }
+
+   std::vector<MemoryBlock*> get_mem_block_by_mem_addr(u64 mem_addr_hit) {
+     std::vector<MemoryBlock*> res = {};
+     for (auto block : _allocated_mem_blocks) {
+       if (mem_addr_hit >= block->ptr && mem_addr_hit < (block->ptr + block->size)) {
+         res.push_back(block);
+       }
+     }
+     return res;
+   }
+
 
    struct ViewNode {
      u64 view_id;
@@ -191,6 +235,8 @@ namespace redshow {
          py_state[i].lineno = arg_py_state[i].lineno;
        } // TODO(Ding): Verify the correctness of shallow copy
      };
+
+     PyStateCTX(){};
    };
 
    std::vector<ViewNode*> _roots = {};  // The node forest //TODO: optimize
@@ -198,13 +244,14 @@ namespace redshow {
    std::vector<mem_range_t> gpu_mem_blocks = {};
 
    /** find view root from the forest */
-   ViewNode* find_root_node(ViewNode r_node) {
+   std::vector<ViewNode*> find_root_node(ViewNode r_node) {
+     std::vector<ViewNode*> ret;
      for (auto node : _roots){
        if (r_node.data_ptr >= node->mem_block_range.first && (r_node.data_ptr + r_node.itemsize * r_node.numel) <= node->mem_block_range.second){
-         return node;
+         ret.push_back(node);
        }
      }
-     return nullptr;
+     return ret;
    }
 
   /**
@@ -222,13 +269,18 @@ namespace redshow {
      data_ptr_t data_ptr = (data_ptr_t)tensor_data.data_ptr;
      metadata_ptr_t metadata_ptr = (metadata_ptr_t)tensor_data.metadata_ptr;
      ViewNode temp = ViewNode{data_ptr, metadata_ptr, tensor_data.numel, tensor_data.itemsize};
-     ViewNode* root_found = find_root_node(temp);
-     if(root_found){
-       ViewNode* view_existed = root_found->find_node(temp);
-       if(view_existed){
+     std::vector<ViewNode*> root_found = find_root_node(temp);
+     ViewNode *view_existed;
+     if(!root_found.empty()) {
+       for (auto riter = root_found.begin(); riter != root_found.end(); riter++) {
+         view_existed = (*riter)->find_node(temp);
+         if (view_existed)
+           break;
+       }
+       if (view_existed) {
          // Update Python State
-         PyStateCTX _state{tensor_data.index, num_states, python_states};
-         call_path_map[view_existed->view_id].push_back(_state);
+//         PyStateCTX _state{tensor_data.index, num_states, python_states};
+//         call_path_map[view_existed->view_id].push_back(_state);
        } else { // found the view node in the forest
          /** insert new view node into correct "view_node._children"
            * 1. find the father node from the root/branch
@@ -239,18 +291,26 @@ namespace redshow {
            torch_monitor_callback_tensor_data_t _tensor = _op_stack.top().input_output_data.tensor_data[i];
            if (_tensor.index == -1 || _tensor.numel <= 0)
              continue;
-           data_ptr_t _tensor_data_ptr = (data_ptr_t)_tensor.data_ptr;
-           metadata_ptr_t _tensor_metadata_ptr = (metadata_ptr_t)_tensor.metadata_ptr;
+           data_ptr_t _tensor_data_ptr = (data_ptr_t) _tensor.data_ptr;
+           metadata_ptr_t _tensor_metadata_ptr = (metadata_ptr_t) _tensor.metadata_ptr;
            ViewNode _input_temp = ViewNode{_tensor_data_ptr, _tensor_metadata_ptr, _tensor.numel, _tensor.itemsize};
-           ViewNode* _input_root = root_found; //find_root_node(_input_temp);
-           ViewNode* _input_view = _input_root->find_node(_input_temp);
+           std::vector<ViewNode*> _input_root = root_found; //find_root_node(_input_temp);
+           ViewNode *_input_view;
+           for (auto iriter = _input_root.begin(); iriter != _input_root.end(); iriter++){
+             _input_view = (*iriter)->find_node(_input_temp);
+             if (_input_view)
+               break;
+           }
            if (!_input_view) // if the candidate father does not exist ; continue and look on the next one
              continue;
-           if ((data_ptr_t)tensor_data.data_ptr >= _input_view->mem_block_range.first && (data_ptr_t)tensor_data.data_ptr <= _input_view->mem_block_range.second) {
+           if ((data_ptr_t) tensor_data.data_ptr >= _input_view->mem_block_range.first &&
+               (data_ptr_t) tensor_data.data_ptr <= _input_view->mem_block_range.second) {
              // add the tensor_data to _tensor(node)'s children
-             ViewNode* _node = new ViewNode(global_id, tensor_data.index, tensor_data.numel, tensor_data.dim, tensor_data.dtype, tensor_data.itemsize,
-                                                                          tensor_data.storage_offset, tensor_data.sizes, tensor_data.strides, data_ptr,
-                                                                          metadata_ptr, _input_view->mem_block_range);
+             ViewNode *_node = new ViewNode(global_id, tensor_data.index, tensor_data.numel, tensor_data.dim,
+                                            tensor_data.dtype, tensor_data.itemsize,
+                                            tensor_data.storage_offset, tensor_data.sizes, tensor_data.strides,
+                                            data_ptr,
+                                            metadata_ptr, _input_view->mem_block_range);
              _input_view->_children.push_back(_node);
              call_path_map[global_id] = std::vector<PyStateCTX>();
              PyStateCTX _state{tensor_data.index, num_states, python_states};
@@ -313,11 +373,16 @@ namespace redshow {
    void update_node_total_access(std::vector<ViewNode*> view_nodes) {
      // lock(); // TODO: Try fix later: another lock; Or try to make it sequential
      for (auto viter : view_nodes) {
-       ViewNode* _root_node = find_root_node(*viter);
-       if (!_root_node) {
+       std::vector<ViewNode*> _root_node = find_root_node(*viter);
+       if (_root_node.empty()) {
          continue;
        }
-       ViewNode* _node = _root_node->find_node(*viter);
+       ViewNode *_node;
+       for (auto riter = _root_node.begin(); riter != _root_node.end(); riter++) {
+         _node = (*riter)->find_node(*viter);
+         if (_node)
+           break;
+       }
        _node->_total_access++;
      }
      // unlock();
@@ -415,39 +480,74 @@ namespace redshow {
    * @param memory_address: address visited on GPU
    * @return the tensor/view been accessed
    */
-   std::vector<ViewNode*> get_view_nodes_by_mem_addr(u64 mem_addr_hit) {
+   std::vector<ViewNode*> get_view_nodes_by_mem_addr(u64 mem_addr_hit, bool is_delay = false) {
      std::vector<torch_monitor_callback_tensor_data_t> possible = {};
      std::vector<torch_monitor_callback_tensor_data_t> sorted = {};
      std::vector<torch_monitor_callback_tensor_data_t> hit = {};
      std::vector<ViewNode*> res = {};
-     torch_monitor_op_data_t op_info = _op_stack.top();
-     torch_monitor_input_output_data_t inputs = op_info.input_output_data;
-     for (int64_t i = 0; i < inputs.size; i++) {
-       torch_monitor_callback_tensor_data_t _tensor = inputs.tensor_data[i];
-       std::cout << "op stack tensor data ptr: " << (u64)_tensor.data_ptr << std::endl;
-       if (_tensor.index == -1 || _tensor.numel <= 0)
-         continue;
-       data_ptr_t _tensor_data_ptr = reinterpret_cast<data_ptr_t>(_tensor.data_ptr);
-       metadata_ptr_t _tensor_metadata_ptr = reinterpret_cast<metadata_ptr_t>(_tensor.metadata_ptr);
-       ViewNode _input_temp = ViewNode{_tensor_data_ptr, _tensor_metadata_ptr, _tensor.numel, _tensor.itemsize};
-       ViewNode* _input_root = find_root_node(_input_temp);
-       if (!_input_root) {
-//         std::cout << "No root---" << std::endl;
-         continue;
+     if (!is_delay) {
+       torch_monitor_op_data_t op_info = _op_stack.top();
+       torch_monitor_input_output_data_t inputs = op_info.input_output_data;
+       for (int64_t i = 0; i < inputs.size; i++) {
+         torch_monitor_callback_tensor_data_t _tensor = inputs.tensor_data[i];
+         std::cout << "op stack tensor data ptr: " << (u64) _tensor.data_ptr << std::endl;
+         if (_tensor.index == -1 || _tensor.numel <= 0)
+           continue;
+         data_ptr_t _tensor_data_ptr = reinterpret_cast<data_ptr_t>(_tensor.data_ptr);
+         metadata_ptr_t _tensor_metadata_ptr = reinterpret_cast<metadata_ptr_t>(_tensor.metadata_ptr);
+         ViewNode _input_temp = ViewNode{_tensor_data_ptr, _tensor_metadata_ptr, _tensor.numel, _tensor.itemsize};
+         std::vector < ViewNode * > _input_root = find_root_node(_input_temp);
+         if (_input_root.empty()) {
+           continue;
+         }
+         ViewNode *_input_view;
+         for (auto iriter = _input_root.begin(); iriter != _input_root.end(); iriter++) {
+           _input_view = (*iriter)->find_node(_input_temp);
+           if (_input_view)
+             break;
+         }
+         if (!_input_view) {
+           continue;
+         }
+         // possible: hit-address roughly fall into view_node.mem_block_range
+         if ((data_ptr_t) mem_addr_hit >= _input_view->mem_block_range.first &&
+             (data_ptr_t) mem_addr_hit <= _input_view->mem_block_range.second) {
+           possible.push_back(_tensor);
+         }
        }
-       ViewNode* _input_view = _input_root->find_node(_input_temp);
-       if (!_input_view) {
-//         std::cout << "No node---" << std::endl;
-         continue;
+     } else{ // if delayed, we will match mem unit access to all roots
+       for(size_t i = 0; i < _roots.size(); i++){
+         if (mem_addr_hit >= _roots.at(i)->mem_block_range.first && mem_addr_hit <= _roots.at(i)->mem_block_range.second) {
+           torch_monitor_callback_tensor_data_t _delayed_temp;
+           _delayed_temp.index = _roots.at(i)->index;
+           _delayed_temp.numel = _roots.at(i)->numel;
+           _delayed_temp.dim = _roots.at(i)->dim;
+           _delayed_temp.dtype = _roots.at(i)->dtype;
+           _delayed_temp.itemsize = _roots.at(i)->itemsize;
+           _delayed_temp.storage_offset = _roots.at(i)->storage_offset;
+           for (size_t j = 0 ;  j < (_delayed_temp.dim < TORCH_MONITOR_MAX_TENSOR_DIMENSION ? _delayed_temp.dim : TORCH_MONITOR_MAX_TENSOR_DIMENSION); j++) {
+             _delayed_temp.sizes[j] = _roots.at(i)->sizes[j];
+             _delayed_temp.strides[j] = _roots.at(i)->strides[j];
+           }
+           _delayed_temp.data_ptr = reinterpret_cast<void*>(_roots.at(i)->data_ptr);
+           _delayed_temp.metadata_ptr = reinterpret_cast<void*>(_roots.at(i)->metadata_ptr);
+           possible.push_back(_delayed_temp);
+         }
        }
-       // possible: hit-address roughly fall into view_node.mem_block_range
-       if ((data_ptr_t)mem_addr_hit >= _input_view->mem_block_range.first && (data_ptr_t)mem_addr_hit <= _input_view->mem_block_range.second) {
-         possible.push_back(_tensor);
-       }
-     }
+     } // end delayed possible search
+
      // sort possible tensor strides
      for(int i = 0; i < possible.size(); i++){
        sorted.push_back(sort_tensor_strides(possible[i]));
+//       std::cout << "Sorted tensor data ptr: " << reinterpret_cast<u64>(sorted[i].data_ptr) << std::endl;
+//       std::cout << "Sorted tensor intrusive ptr: " << reinterpret_cast<u64>(sorted[i].metadata_ptr) << std::endl;
+//       std::cout << "Sorted tensor dim: " << sorted[i].dim << std::endl;
+//       for(size_t j = 0; j < sorted[i].dim; j++) {
+//         std::cout << sorted[i].sizes[j] << std::endl;
+//       }
+//       for(size_t j = 0; j < sorted[i].dim; j++) {
+//         std::cout << sorted[i].strides[j] << std::endl;
+//       }
      }
      // find hit tensor
      for(int i = 0; i < sorted.size(); i++){
@@ -464,13 +564,19 @@ namespace redshow {
          }
        }
      }
+
      // assemble the results
      for(int64_t i = 0; i < hit.size(); i++){
        data_ptr_t _hit_data_ptr = reinterpret_cast<data_ptr_t>(hit[i].data_ptr);
        metadata_ptr_t _hit_metadata_ptr = reinterpret_cast<metadata_ptr_t>(hit[i].metadata_ptr);
        ViewNode _input_temp = ViewNode{_hit_data_ptr, _hit_metadata_ptr, hit[i].numel, hit[i].itemsize};
-       ViewNode* _input_root = find_root_node(_input_temp);
-       ViewNode* _input_view = _input_root->find_node(_input_temp);
+       std::vector<ViewNode*> _input_root = find_root_node(_input_temp);
+       ViewNode *_input_view;
+       for (auto iriter = _input_root.begin(); iriter != _input_root.end(); iriter++) {
+         _input_view = (*iriter)->find_node(_input_temp);
+         if (_input_view)
+           break;
+       }
        res.push_back(_input_view);
      }
      std::cout << "possible size: " << possible.size() << std::endl;
@@ -485,6 +591,7 @@ namespace redshow {
      // here use memory range to loge access range but not allocation and sub-allocation
      // u64: Memory:Operation->op_id
      // don't care about read or write in this mode, just need to know access or not
+     // PyStateCTX python_state;
      Map<u64, i32> access_memory; // map with sort but vector not
 
      TorchViewTrace() = default;
@@ -492,7 +599,22 @@ namespace redshow {
      virtual ~TorchViewTrace() {}
    };
 
+    struct TorchViewDelayedTrace final : public Trace {
+      // only need to know memory access, don't care read or write
+      // here use memory range to loge access range but not allocation and sub-allocation
+      // u64: Memory:Operation->op_id
+      // don't care about read or write in this mode, just need to know access or not
+      PyStateCTX python_state;
+      Map<u64, i32> access_memory; // map with sort but vector not
+
+      TorchViewDelayedTrace() = default;
+
+      virtual ~TorchViewDelayedTrace() {}
+    };
+
    std::shared_ptr<TorchViewTrace> _trace;
+
+    std::shared_ptr<TorchViewDelayedTrace> _delayed_trace;
 
    Map<u64, std::shared_ptr<Memory>> _memories;
 

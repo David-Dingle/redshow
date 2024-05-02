@@ -81,35 +81,52 @@ namespace redshow {
       // If the kernel is sampled
       return;
     }
+    if (_delayed_trace.get() != NULL){ // if the previous kernel view-node mapping is delayed
+      /** handle delayed unit access:
+       *  1. map unit access to the updated forest
+       *  2. if the map miss again, attribute the access to PyTorch Allocator's mem-block
+       */
+      std::cout << "Delayed " <<  _delayed_trace->access_memory.size() << " memory accesses." << std::endl;
+      for (auto &trace_iter : _delayed_trace->access_memory) {
+        u64 mem_start = trace_iter.first;
+        std::vector<ViewNode*> view_node_hit_mem = get_view_nodes_by_mem_addr(mem_start, true);
+        update_node_total_access(view_node_hit_mem);
+        // Update Call ctc_id to CallPath
+//        for (auto viter = view_node_hit_mem.begin(); viter != view_node_hit_mem.end(); viter++){
+//          call_path_map[(*viter)->view_id].back().ctx_id.push_back(_trace->access_memory[mem_start]);
+//        }
+        std::cout << "Delayed Kernel Access Hits: " << view_node_hit_mem.size() << " View Node(s). :: " << mem_start << std::endl;
+        if(view_node_hit_mem.empty()){
+          std::vector<MemoryBlock*> mem_blocks_hit = get_mem_block_by_mem_addr(mem_start);
+          std::cout << "Memory Block Hit: " << mem_blocks_hit.size() << std::endl;
+        }
+      }
+      _delayed_trace = NULL; // reset delayed trace to NULL
+    }
+    if (!_delayed_trace) {
+      _delayed_trace = std::make_shared<TorchViewDelayedTrace>();
+      // TODO(): assign current Python State to it's field
+    }
     std::cout << "We Got " <<  _trace->access_memory.size() << " memory accesses." << std::endl;
     for (auto &trace_iter : _trace->access_memory) {
       u64 mem_start = trace_iter.first;
       std::vector<ViewNode*> view_node_hit_mem = get_view_nodes_by_mem_addr(mem_start);
-
-//      if (view_node_hit_mem.size() == 0) {
-//        bool flag = true;
-//        while(flag){
-//          std::cout<< "happy."<<std::endl;
-//        }
-//      }
-
-//      if (view_node_hit_mem.size() == 0) {
-//        for (; view_node_hit_mem.size() == 0 && _op_stack.size( )>= 2;) {
-//          _op_stack_temp.push(_op_stack.top());
-//          _op_stack.pop();
-//          view_node_hit_mem = get_view_nodes_by_mem_addr(mem_start);
-//        }
-//        for(; !_op_stack_temp.empty(); ) {
-//          _op_stack.push(_op_stack_temp.top());
-//          _op_stack_temp.pop();
-//        }
-//      }
       update_node_total_access(view_node_hit_mem);
       // Update Call ctc_id to CallPath
-      for (auto viter = view_node_hit_mem.begin(); viter != view_node_hit_mem.end(); viter++){
-        call_path_map[(*viter)->view_id].back().ctx_id.push_back(_trace->access_memory[mem_start]);
-      }
+//      for (auto viter = view_node_hit_mem.begin(); viter != view_node_hit_mem.end(); viter++){
+//        call_path_map[(*viter)->view_id].back().ctx_id.push_back(_trace->access_memory[mem_start]);
+//      }
       std::cout << "Kernel Access Hits: " << view_node_hit_mem.size() << " View Node(s). :: " << mem_start << std::endl;
+      if (view_node_hit_mem.empty()){
+        if (!_delayed_trace->access_memory.has(trace_iter.first)) {
+          _delayed_trace->access_memory.emplace(trace_iter.first, trace_iter.second);
+        }
+      }
+    }
+    std::cout << "Will delay mem size: " << _delayed_trace->access_memory.size() << std::endl;
+    // check if any unit access has been delayed
+    if(_delayed_trace->access_memory.empty()){
+      _delayed_trace = NULL;
     }
     _trace->access_memory.clear();
     _trace = NULL;

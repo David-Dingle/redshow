@@ -220,8 +220,8 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
               torch_monitor_callback_tensor_data_t titer = callback_data->data.op_data.input_output_data.tensor_data[i];
               if (titer.index == -1 || titer.numel <= 0)
                 continue;
-              u64 op_id = update_op_id_func();
-              analysis_ptr->update_view_forest(titer, op_id);  // update the view forest
+              u64 view_id = update_op_id_func();
+              analysis_ptr->update_view_forest(titer, view_id);  // update the view forest
             }
           }
         }  // ends stack operation
@@ -232,6 +232,18 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
       if (callback_data->data.mem_data.type == TORCH_MONITOR_MEM_DATA_ALLOC) {
         std::cout << "Allocate ptr: " << std::hex << callback_data->data.mem_data.ptr
                   << std::dec << std::endl;
+        u64 mem_block_id = update_op_id_func();
+        /**
+         * register a memory block
+         * */
+        for (auto iter : analysis_enabled){
+          if (iter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
+            std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
+            analysis_ptr->register_memory_block(mem_block_id, callback_data->data.mem_data.device_type, callback_data->data.mem_data.ptr,
+                                                callback_data->data.mem_data.size, callback_data->data.mem_data.total_allocated,
+                                                callback_data->data.mem_data.total_reserved);
+          }
+        } // ends memory block registration
       } else {
         std::cout << "Free ptr: " << std::hex << callback_data->data.mem_data.ptr
                   << std::dec << std::endl;
@@ -249,7 +261,16 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
 //            }
 //#endif
           }
-        }  // ends removing
+        }  // ends removing View Nodes
+        /**
+         * unregister a memory block
+         * */
+        for (auto iter : analysis_enabled){
+          if (iter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
+            std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
+            analysis_ptr->unregister_memory_block(callback_data->data.mem_data.ptr);
+          }
+        } // ends memory block unregistration
       }
       if (callback_data->data.mem_data.device_type == TORCH_MONITOR_DEVICE_TYPE_CPU) {
         std::cout << "Device: CPU" << std::endl;
@@ -293,8 +314,8 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
               torch_monitor_callback_tensor_data_t titer = callback_data->data.op_data.input_output_data.tensor_data[i];
               if (titer.index == -1 || titer.numel <= 0)
                 continue;
-              u64 op_id = update_op_id_func();
-              analysis_ptr->update_view_forest(titer, op_id);  // update the view forest
+              u64 view_id = update_op_id_func();
+              analysis_ptr->update_view_forest(titer, view_id);  // update the view forest
             }
             analysis_ptr->_op_stack.pop();
           }
