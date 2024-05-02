@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "analysis/torch_view.h"  // new model
 #include "analysis/torch_monitor.h"
 #include "analysis/data_dependency.h"
 #include "analysis/memory_liveness.h"
@@ -84,10 +85,12 @@ static int decimal_degree_f64 = VALID_DOUBLE_DIGITS;
 
 static redshow_data_type_t default_data_type = REDSHOW_DATA_UNKNOWN;
 
+static std::mutex mtx;  // the lock for torch_view functional callback
+
 static void torch_memory_callback(torch_monitor_callback_site_t callback_site,
-                            torch_monitor_callback_data_t* callback_data) {
-    if (callback_site == TORCH_MONITOR_CALLBACK_ENTER) {
-       std::cout << "Torch_Domain: " << callback_data->domain << std::endl;
+                                  torch_monitor_callback_data_t* callback_data) {
+  if (callback_site == TORCH_MONITOR_CALLBACK_ENTER) {
+    std::cout << "Torch_Domain: " << callback_data->domain << std::endl;
       if (callback_data->domain == TORCH_MONITOR_DOMAIN_MEMORY
           && callback_data->data.mem_data.device_type == TORCH_MONITOR_DEVICE_TYPE_GPU) {
         std::cout << "Current thread id: " << callback_data->current_thread_id << std::endl;
@@ -110,11 +113,222 @@ static void torch_memory_callback(torch_monitor_callback_site_t callback_site,
           );
       
         }
+      std::cout << "Size: " << callback_data->data.mem_data.size << std::endl;
+      std::cout << "Total size: " << callback_data->data.mem_data.total_allocated << std::endl;
+      std::cout << "Total reserved: " << callback_data->data.mem_data.total_reserved << std::endl;
+    }
+  }
+}
+
+/**
+ * Handle with the PyTorch function callback inputs/outputs data storage.
+ *
+ * */
+static void torch_callback_inputs_outputs_report(torch_monitor_callback_site_t callback_site,
+                                           torch_monitor_callback_data_t* callback_data) {
+  int64_t num_data = callback_data->data.op_data.input_output_data.size;
+  if (callback_site == TORCH_MONITOR_CALLBACK_ENTER) {
+    std::cout << "Callback inputs length: " << num_data << std::endl;
+  } else if (callback_site == TORCH_MONITOR_CALLBACK_EXIT) {
+    std::cout << "Callback outputs length: " << num_data << std::endl;
+  }
+  if (num_data <= 0)
+    return;
+  for (int64_t i = 0; i < num_data; i++) {
+    torch_monitor_callback_tensor_data_t tensor =
+          callback_data->data.op_data.input_output_data.tensor_data[i];
+    if (tensor.index == -1 || tensor.numel <= 0)
+      continue;
+    std::cout << "  Index: " << tensor.index + 1 << std::endl;
+    std::cout << "    Tensor elements: " << (std::int64_t)tensor.numel << std::endl;
+    std::cout << "    Tensor dim: " << (std::int64_t)tensor.dim << std::endl;
+    std::cout << "    Tensor dtype: " << torch_monitor_dtype_name_get(tensor.dtype)
+              << std::endl;
+    std::cout << "    Tensor itemsize: " << tensor.itemsize
+              << std::endl;
+    std::cout << "    Tensor storage offset: " << (std::int64_t)tensor.storage_offset
+              << std::endl;
+    std::cout << "    Tensor sizes: ";
+    for (int64_t j = 0;
+         j < std::min<int64_t>(TORCH_MONITOR_MAX_TENSOR_DIMENSION, tensor.dim); j++) {
+      std::cout << tensor.sizes[j] << ", ";
+    }
+    std::cout << std::endl;
+    std::cout << "    Tensor strides: ";
+    for (int64_t j = 0;
+         j < std::min<int64_t>(TORCH_MONITOR_MAX_TENSOR_DIMENSION, tensor.dim); j++) {
+      std::cout << tensor.strides[j] << ", ";
+    }
+    std::cout << std::endl;
+    std::cout << "    Tensor block address: " << /**std::hex <<*/ (u64)tensor.data_ptr << std::dec
+              << std::endl;
+    std::cout << "    Intrusive Ptr: " << /**std::hex <<*/ (u64)tensor.metadata_ptr << std::dec
+              << std::endl;
+  }
+}
+
+static void python_state_report() {
+  size_t num_states = 0;
+  // Allow empty states
+  torch_monitor_python_state_get(MAX_NUM_STATES, python_states, &num_states);
+  for (size_t i = 0; i < num_states; ++i) {
+    std::cout << "(" << i << ") "
+              << "File: " << std::string(python_states[i].file_name) << std::endl;
+    std::cout << "\tFunction: " << std::string(python_states[i].function_name)
+              << std::endl;
+    std::cout << "\tFirst line: " << python_states[i].function_first_lineno << std::endl;
+    std::cout << "\tCall at line: " << python_states[i].lineno << std::endl;
+  }
+}
+
+/**
+ * for the model 'torch_view'
+ * Handle with the PyTorch function callback info
+ * */
+static void torch_view_callback(torch_monitor_callback_site_t callback_site,
+                                  torch_monitor_callback_data_t* callback_data) {
+  std::lock_guard<std::mutex> lock_guard(mtx);
+  std::cout << "-----------------------------------" << std::endl;
+  if (callback_site == TORCH_MONITOR_CALLBACK_ENTER) {
+    std::cout << "Enter Domain: " << callback_data->domain << std::endl;
+    if (callback_data->domain != TORCH_MONITOR_DOMAIN_MEMORY) {
+      std::cout << "Current thread id: " << callback_data->current_thread_id << std::endl;
+      std::cout << "Forward thread id: " << callback_data->data.op_data.forward_thread_id
+                << std::endl;
+      std::cout << "Sequence number: " << callback_data->data.op_data.sequence_number
+                << std::endl;
+      std::cout << "Name: " << std::string(callback_data->data.op_data.name) << std::endl;
+      if (true) {  //timestamp_enable) {
+        std::cout << "Enter level: " << callback_data->data.op_data.nested_level << " at "
+                  << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::system_clock::now().time_since_epoch()).count()
+                  << std::endl;
+      }
+      if (true) { //python_state_enable) {
+        // python_state_report();
+        torch_monitor_python_state_get(MAX_NUM_STATES, python_states, &num_states);
+      }
+      if (torch_monitor_inputs_capture_enable_get()) {
+        /**
+         * push the PyTorch functional callback op data into the op_stack
+         */
+        for (auto iter : analysis_enabled){
+          if (iter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
+            std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
+            analysis_ptr->_op_stack.push(callback_data->data.op_data);
+            for (int64_t i = 0 ; i < callback_data->data.op_data.input_output_data.size; i++) {
+              torch_monitor_callback_tensor_data_t titer = callback_data->data.op_data.input_output_data.tensor_data[i];
+              if (titer.index == -1 || titer.numel <= 0)
+                continue;
+              u64 view_id = update_op_id_func();
+              analysis_ptr->update_view_forest(titer, view_id);  // update the view forest
+            }
+          }
+        }  // ends stack operation
+        torch_callback_inputs_outputs_report(callback_site, callback_data);
+      }
+    } else {
+      std::cout << "Current thread id: " << callback_data->current_thread_id << std::endl;
+      if (callback_data->data.mem_data.type == TORCH_MONITOR_MEM_DATA_ALLOC) {
+        std::cout << "Allocate ptr: " << std::hex << callback_data->data.mem_data.ptr
+                  << std::dec << std::endl;
+        u64 mem_block_id = update_op_id_func();
+        /**
+         * register a memory block
+         * */
+        for (auto iter : analysis_enabled){
+          if (iter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
+            std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
+            analysis_ptr->register_memory_block(mem_block_id, callback_data->data.mem_data.device_type, callback_data->data.mem_data.ptr,
+                                                callback_data->data.mem_data.size, callback_data->data.mem_data.total_allocated,
+                                                callback_data->data.mem_data.total_reserved);
+          }
+        } // ends memory block registration
+      } else {
+        std::cout << "Free ptr: " << std::hex << callback_data->data.mem_data.ptr
+                  << std::dec << std::endl;
+        /**
+         * remove an entire tree from the view_node forest;
+         **/
+        for (auto iter : analysis_enabled){
+          if (iter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
+            std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
+            analysis_ptr->delete_forest_tree((redshow::TorchView::data_ptr_t)callback_data->data.mem_data.ptr,
+                                             (int64_t)callback_data->data.mem_data.total_allocated);
+//#ifdef DEBUG
+//            for (auto titer : analysis_ptr->_roots){
+//              analysis_ptr->visualize_view_forest(titer);
+//            }
+//#endif
+          }
+        }  // ends removing View Nodes
+        /**
+         * unregister a memory block
+         * */
+        for (auto iter : analysis_enabled){
+          if (iter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
+            std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
+            analysis_ptr->unregister_memory_block(callback_data->data.mem_data.ptr);
+          }
+        } // ends memory block unregistration
+      }
+      if (callback_data->data.mem_data.device_type == TORCH_MONITOR_DEVICE_TYPE_CPU) {
+        std::cout << "Device: CPU" << std::endl;
+      } else if (callback_data->data.mem_data.device_type = TORCH_MONITOR_DEVICE_TYPE_GPU) {
+        std::cout << "Device: GPU" << std::endl;
+      } else {
+        std::cout << "Device: Other" << std::endl;
+      }
         std::cout << "Size: " << callback_data->data.mem_data.size << std::endl;
-        std::cout << "Total size: " << callback_data->data.mem_data.total_allocated << std::endl;
-        std::cout << "Total reserved: " << callback_data->data.mem_data.total_reserved << std::endl;
+        std::cout << "Total size: " << callback_data->data.mem_data.total_allocated
+                  << std::endl;
+        std::cout << "Total reserved: " << callback_data->data.mem_data.total_reserved
+                  << std::endl;
+    }
+  } else if (callback_site == TORCH_MONITOR_CALLBACK_EXIT) {
+    if (callback_data->domain != TORCH_MONITOR_DOMAIN_MEMORY) {
+      if (true) {  //timestamp_enable) {
+        std::cout << "Exit level: " << callback_data->data.op_data.nested_level << " at "
+                  << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::system_clock::now().time_since_epoch()).count()
+                  << std::endl;
       }
     }
+    std::cout << "Exit Domain: " << callback_data->domain << std::endl;
+    std::cout << "Current thread id: " << callback_data->current_thread_id << std::endl;
+    std::cout << "Forward thread id: " << callback_data->data.op_data.forward_thread_id
+              << std::endl;
+    std::cout << "Sequence number: " << callback_data->data.op_data.sequence_number
+              << std::endl;
+    std::cout << "Name: " << std::string(callback_data->data.op_data.name) << std::endl;
+    if (torch_monitor_outputs_capture_enable_get()) {
+      /**
+       * pop the top element from the op_stack
+       */
+      for (auto iter : analysis_enabled){
+        if (iter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
+          std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
+          if (analysis_ptr->_op_stack.size() > 0) {
+            analysis_ptr->_popped_op = analysis_ptr->_op_stack.top();
+            for (int64_t i = 0 ; i < callback_data->data.op_data.input_output_data.size; i ++) {
+              torch_monitor_callback_tensor_data_t titer = callback_data->data.op_data.input_output_data.tensor_data[i];
+              if (titer.index == -1 || titer.numel <= 0)
+                continue;
+              u64 view_id = update_op_id_func();
+              analysis_ptr->update_view_forest(titer, view_id);  // update the view forest
+            }
+            analysis_ptr->_op_stack.pop();
+          }
+#ifdef DEBUG
+          for (auto titer : analysis_ptr->_roots){
+            analysis_ptr->visualize_view_forest(titer);
+          }
+#endif
+        }
+      }
+      torch_callback_inputs_outputs_report(callback_site, callback_data);
+    }
+  }
 }
 
 static redshow_result_t analyze_cubin(const char *path, SymbolVector &symbols,
@@ -648,6 +862,52 @@ redshow_result_t redshow_torch_enable() {
   return REDSHOW_SUCCESS;   
 }
 
+redshow_result_t redshow_torch_view_enable() {
+  /**
+   * enable inputs outputs capturing
+   */
+  torch_monitor_inputs_capture_enable_set(true);
+  torch_monitor_outputs_capture_enable_set(true);
+  if (!(torch_monitor_inputs_capture_enable_get() && torch_monitor_outputs_capture_enable_get())) {
+    std::cerr << "Inputs and Outputs capturing is not enabled." << std::endl;
+    exit(1);
+  }
+
+  torch_monitor_status status = torch_monitor_domain_enable(TORCH_MONITOR_DOMAIN_FUNCTION);
+  if (status != TORCH_MONITOR_STATUS_SUCCESS) {
+    std::cerr << "Torch monitor status: " << status << std::endl;
+    exit(1);
+  }
+
+  status = torch_monitor_domain_enable(TORCH_MONITOR_DOMAIN_BACKWARD_FUNCTION);
+  if (status != TORCH_MONITOR_STATUS_SUCCESS) {
+    std::cerr << "Torch monitor status: " << status << std::endl;
+    exit(1);
+  }
+
+  status = torch_monitor_domain_enable(TORCH_MONITOR_DOMAIN_MEMORY);
+  if (status != TORCH_MONITOR_STATUS_SUCCESS) {
+    std::cerr << "Torch monitor status: " << status << std::endl;
+    exit(1);
+  }
+  /**
+   * "torch_view_callback"
+   * the updated driver func that enabled function callback inputs/outputs capturing
+   * */
+  status = torch_monitor_callback_subscribe(torch_view_callback);
+  if (status != TORCH_MONITOR_STATUS_SUCCESS) {
+    std::cerr << "Torch monitor status: " << status << std::endl;
+    exit(1);
+  }
+  status = torch_monitor_init();
+  if (status != TORCH_MONITOR_STATUS_SUCCESS) {
+    std::cerr << "Torch monitor status: " << status << std::endl;
+    exit(1);
+  }
+
+  return REDSHOW_SUCCESS;
+}
+
 // invoked by sanitizer-api.c
 redshow_result_t redshow_get_op_id_register(redshow_get_op_id func) {
   update_op_id_func = func;
@@ -655,9 +915,15 @@ redshow_result_t redshow_get_op_id_register(redshow_get_op_id func) {
   return REDSHOW_SUCCESS;
 }
 
+/**
+ *
+ * Create Analysis Object
+ * @param analysis_type
+ * @return
+ */
 redshow_result_t redshow_analysis_enable(redshow_analysis_type_t analysis_type) {
   PRINT("\nredshow-> Enter redshow_analysis_enable\nanalysis_type: %u\n", analysis_type);
-
+  printf("Enter Sanitizer %u enable \n", analysis_type);
   redshow_result_t result = REDSHOW_SUCCESS;
 
   switch (analysis_type) {
@@ -689,6 +955,9 @@ redshow_result_t redshow_analysis_enable(redshow_analysis_type_t analysis_type) 
       break;
     case REDSHOW_ANALYSIS_TORCH_MONITOR:
       analysis_enabled.emplace(REDSHOW_ANALYSIS_TORCH_MONITOR, std::make_shared<TorchMonitor>());
+      break;
+    case REDSHOW_ANALYSIS_TORCH_VIEW:
+      analysis_enabled.emplace(REDSHOW_ANALYSIS_TORCH_VIEW, std::make_shared<TorchView>());
       break;
     default:
       result = REDSHOW_ERROR_NO_SUCH_ANALYSIS;
@@ -1200,6 +1469,8 @@ redshow_result_t redshow_record_data_callback_register(redshow_record_data_callb
 }
 
 redshow_result_t redshow_tool_dtoh_register(redshow_tool_dtoh_func func) {
+  std::cout << "modules we have: ";
+  std::cout << analysis_enabled.size() << std::endl;
   for (auto &aiter : analysis_enabled) {
     aiter.second->dtoh_register(func);
   }

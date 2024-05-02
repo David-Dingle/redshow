@@ -19,7 +19,8 @@ typedef enum redshow_analysis_type {
   REDSHOW_ANALYSIS_MEMORY_HEATMAP = 6,
   REDSHOW_ANALYSIS_MEMORY_LIVENESS = 7,
   REDSHOW_ANALYSIS_DATA_DEPENDENCY = 8,
-  REDSHOW_ANALYSIS_TORCH_MONITOR = 9
+  REDSHOW_ANALYSIS_TORCH_MONITOR = 9,
+  REDSHOW_ANALYSIS_TORCH_VIEW = 10
   
 } redshow_analysis_type_t;
 
@@ -170,6 +171,11 @@ EXTERNC redshow_result_t redshow_get_op_id_register(redshow_get_op_id func);
  * @brief enable pytorch analysis
  **/
 EXTERNC redshow_result_t redshow_torch_enable();
+
+/**
+ * @brief enable pytorch view analysis
+ */
+EXTERNC redshow_result_t redshow_torch_view_enable();
 
 /**
  * @brief This function is used to setup specific analysis types.
