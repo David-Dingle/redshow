@@ -9,6 +9,7 @@
 #include <map>
 #include <queue>
 #include <set>
+#include <string.h>
 
 #include "torch_monitor.h"
 
@@ -76,7 +77,7 @@ namespace redshow {
  * Need fix
  * */
   void TorchView::kernel_op_callback(std::shared_ptr<Kernel> op) {
-    std::cout << "Enter TORCH_VIEW Kernel op callback." << std::endl;
+    // std::cout << "Enter TORCH_VIEW Kernel op callback." << std::endl;
     if (_trace.get() == NULL) {
       // If the kernel is sampled
       return;
@@ -91,21 +92,31 @@ namespace redshow {
         u64 mem_start = trace_iter.first;
         std::vector<ViewNode*> view_node_hit_mem = get_view_nodes_by_mem_addr(mem_start, true);
         update_node_total_access(view_node_hit_mem);
-        // Update Call ctc_id to CallPath
-//        for (auto viter = view_node_hit_mem.begin(); viter != view_node_hit_mem.end(); viter++){
-//          call_path_map[(*viter)->view_id].back().ctx_id.push_back(_trace->access_memory[mem_start]);
-//        }
+        // Update Call ctc_id to CallPath TODO: use the old python state and then insert ctx_id
+        for (auto viter = view_node_hit_mem.begin(); viter != view_node_hit_mem.end(); viter++){
+          _delayed_trace->python_state.object_type = VIEW_NODE;
+          call_path_map[(*viter)->view_id].push_back(_delayed_trace->python_state);
+          call_path_map[(*viter)->view_id].back().ctx_id.push_back(_trace->access_memory[mem_start]);
+        }
         std::cout << "Delayed Kernel Access Hits: " << view_node_hit_mem.size() << " View Node(s). :: " << mem_start << std::endl;
         if(view_node_hit_mem.empty()){
           std::vector<MemoryBlock*> mem_blocks_hit = get_mem_block_by_mem_addr(mem_start);
           std::cout << "Memory Block Hit: " << mem_blocks_hit.size() << std::endl;
+          // TODO insert mem_block_id, delayed_Python_state, object_type, and ctx_id in the call_path_map
+          for (auto miter : mem_blocks_hit) {
+            _delayed_trace->python_state.object_type = MEMORY_BLOCK;
+            call_path_map[(*miter).block_id].push_back(_delayed_trace->python_state);
+            call_path_map[(*miter).block_id].back().ctx_id.push_back(_trace->access_memory[mem_start]);
+          }
         }
       }
       _delayed_trace = NULL; // reset delayed trace to NULL
     }
     if (!_delayed_trace) {
       _delayed_trace = std::make_shared<TorchViewDelayedTrace>();
-      // TODO(): assign current Python State to it's field
+      // TODO(): assign current Python State to it's field for delayed useage
+      PyStateCTX _state{-1, num_states, python_states};
+      _delayed_trace->python_state = _state;
     }
     std::cout << "We Got " <<  _trace->access_memory.size() << " memory accesses." << std::endl;
     for (auto &trace_iter : _trace->access_memory) {
@@ -113,9 +124,9 @@ namespace redshow {
       std::vector<ViewNode*> view_node_hit_mem = get_view_nodes_by_mem_addr(mem_start);
       update_node_total_access(view_node_hit_mem);
       // Update Call ctc_id to CallPath
-//      for (auto viter = view_node_hit_mem.begin(); viter != view_node_hit_mem.end(); viter++){
-//        call_path_map[(*viter)->view_id].back().ctx_id.push_back(_trace->access_memory[mem_start]);
-//      }
+      for (auto viter = view_node_hit_mem.begin(); viter != view_node_hit_mem.end(); viter++){
+        call_path_map[(*viter)->view_id].back().ctx_id.push_back(_trace->access_memory[mem_start]);
+      } // TODO need to be tested
       std::cout << "Kernel Access Hits: " << view_node_hit_mem.size() << " View Node(s). :: " << mem_start << std::endl;
       if (view_node_hit_mem.empty()){
         if (!_delayed_trace->access_memory.has(trace_iter.first)) {
@@ -153,6 +164,23 @@ namespace redshow {
       update_node_total_access(view_node_hit_src);
       update_node_total_access(view_node_hit_dst);
       update_node_total_access(view_node_hit_shadow);
+
+      // TODO update call_path_map
+      if(!view_node_hit_src.empty()) {
+        for (auto viter: view_node_hit_src) {
+          call_path_map[(*viter).view_id].back().ctx_id.push_back(op->ctx_id);
+        }
+      }
+      if(!view_node_hit_dst.empty()) {
+        for (auto viter: view_node_hit_dst) {
+          call_path_map[(*viter).view_id].back().ctx_id.push_back(op->ctx_id);
+        }
+      }
+      if(!view_node_hit_shadow.empty()) {
+        for (auto viter: view_node_hit_shadow) {
+          call_path_map[(*viter).view_id].back().ctx_id.push_back(op->ctx_id);
+        }
+      }
     }
   }
 
@@ -170,6 +198,17 @@ namespace redshow {
                                      view_node_hit_shadow.size() << " view nodes." << std::endl;
       update_node_total_access(view_node_hit_start);
       update_node_total_access(view_node_hit_shadow);
+
+      if(!view_node_hit_start.empty()){
+        for (auto viter : view_node_hit_start) {
+          call_path_map[(*viter).view_id].back().ctx_id.push_back(op->ctx_id);
+        }
+      }
+      if(!view_node_hit_shadow.empty()){
+        for (auto viter : view_node_hit_shadow) {
+          call_path_map[(*viter).view_id].back().ctx_id.push_back(op->ctx_id);
+        }
+      }
     }
   }
 
@@ -201,20 +240,6 @@ namespace redshow {
   void TorchView::unit_access(i32 kernel_id, u64 host_op_id, const ThreadId &thread_id,
                                  const AccessKind &access_kind, const Memory &memory, u64 pc,
                                  u64 value, u64 addr, u32 index, GPUPatchFlags flags) {
-//    if (memory.op_id >= REDSHOW_MEMORY_UVM) {
-//      return;
-//    }
-//    auto &memory_range = memory.memory_range;
-//    if (flags & GPU_PATCH_READ) {
-//      if (_configs[REDSHOW_ANALYSIS_READ_TRACE_IGNORE] == false) {
-//        merge_memory_range(_trace->read_memory[memory.op_id], memory_range);
-//      } else if (_trace->read_memory[memory.op_id].empty()) {
-//        _trace->read_memory[memory.op_id].insert(memory_range);
-//      }
-//    }
-//    if (flags & GPU_PATCH_WRITE) {
-//      merge_memory_range(_trace->write_memory[memory.op_id], memory_range);
-//    }
     std::cout << "ENTER TORCH VIEW UNIT ACCESS: " << memory.memory_range.start << std::endl;
     if (!_trace->access_memory.has(memory.memory_range.start)) {
       _trace->access_memory.emplace(memory.memory_range.start, memory.ctx_id);
@@ -227,6 +252,89 @@ namespace redshow {
                                   redshow_record_data_callback_func record_data_callback) {}
 
   void TorchView::flush(const std::string &output_dir, const LockableMap<u32, Cubin> &cubins,
-                           redshow_record_data_callback_func record_data_callback) {}
+                        redshow_record_data_callback_func record_data_callback)
+//  {
+//    std::ofstream out(output_dir + "torch_view_report.json");
+//    out << "[" << std::endl; // file begin
+//    for(auto iter = call_path_map.begin(); iter != call_path_map.end(); ){
+//      out << " {" << std::endl; // call_path_map item begin
+//        out << "  \"id\": " << iter->first << "," << std::endl;
+//        out << "  \"python_state\": [" << std::endl; // Python StateS begin
+//        for(auto siter = iter->second.begin(); siter != iter->second.end(); ){
+//          out << "   {" << std::endl; // State begin
+//          out << "    \"index\": " << siter->index << "," << std::endl;
+//          out << "    \"num_states\": " << siter->num_states << "," << std::endl;
+//          out << "    \"py_state\": [" << std::endl; // py_state begin
+//          size_t state_length = (siter->num_states < MAX_NUM_STATES ? siter->num_states : MAX_NUM_STATES);
+//          for(size_t i = 0; i < state_length; ) {
+//            out << "    {" << std::endl; // torch_monitor_python_state_t begin
+//            out << "     " << "\"file_name\": \""<< siter->py_state[i].file_name << "\"," << std::endl;
+//            out << "     " << "\"function_name\": \""<< siter->py_state[i].function_name << "\"," << std::endl;
+//            out << "     " << "\"function_first_lineno\": "<< siter->py_state[i].function_first_lineno << ","<< std::endl;
+//            out << "     " << "\"lineno\": "<< siter->py_state[i].lineno << std::endl;
+//            if (++i != state_length){
+//              out << "    }," << std::endl;} // torch_monitor_python_state_t ends
+//            else {
+//              out << "    }" << std::endl;}
+//          }
+//          out << "    ]," << std::endl; // py_state end
+//          out << "    \"object_type\": " << (int)siter->object_type << "," << std::endl;
+//          out << "    \"ctx_id\": [" << std::endl; // ctx_id begin
+//          for(auto citer = siter->ctx_id.begin(); citer != siter->ctx_id.end(); ){
+//            out << "    " << (*citer);
+//            if (++citer != siter->ctx_id.end()){
+//              out << ",";
+//            }
+//            out << std::endl;
+//          }
+//          out << "    ]" << std::endl; // ctx_id end
+//          out << "   }";
+//          if (++siter != iter->second.end()){
+//            out << ",";
+//          }
+//          out << std::endl;
+//        }
+//        out << "   ]" << std::endl; // Python stateS end
+//      out << " }";
+//      if (++iter != call_path_map.end()) {
+//        out << ",";
+//      }
+//      out << std::endl;
+//      //--iter;
+//    }
+//    out << "]" << std::endl; // file end
+//    out.close();
+//  }
+/**
+ * new version
+ * */
+  {
+    std::ofstream out(output_dir + "torch_view_report.csv");
+
+    for(auto iter = call_path_map.begin(); iter != call_path_map.end(); iter++){
+      out << "id " << iter->first << std::endl;
+      out << "python_state " << std::endl; // Python StateS begin
+      for(auto siter = iter->second.begin(); siter != iter->second.end(); siter++){
+        out << "index " << siter->index << std::endl;
+        out << "num_states " << siter->num_states << std::endl;
+        out << "py_state " << std::endl; // py_state begin
+        size_t state_length = (siter->num_states < MAX_NUM_STATES ? siter->num_states : MAX_NUM_STATES);
+        for(size_t i = 0; i < state_length; i++) {
+          out << "file_name "<< siter->py_state[i].file_name << std::endl;
+          out << "function_name "<< siter->py_state[i].function_name << std::endl;
+          out << "function_first_lineno "<< siter->py_state[i].function_first_lineno << std::endl;
+          out << "lineno "<< siter->py_state[i].lineno << std::endl;
+        }
+        out << "object_type " << (int)siter->object_type << std::endl;
+        out << "ctx_id " << std::endl; // ctx_id begin
+        for(auto citer = siter->ctx_id.begin(); citer != siter->ctx_id.end(); citer++){
+          out << (*citer) << std::endl;
+        }
+        out << std::endl;
+      }
+    }
+
+    out.close();
+  }
 
 }  // namespace redshow

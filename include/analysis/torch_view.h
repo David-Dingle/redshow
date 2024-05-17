@@ -34,6 +34,7 @@
 #include "/home/xjding/Projects/new_DrGPUM/DrGPUM/torch-monitor/include/torch_monitor.h"
 
 #include <fstream>
+#include <string.h>
 
 const static size_t MAX_NUM_STATES = 30;
 thread_local static size_t num_states;
@@ -79,6 +80,12 @@ namespace redshow {
    typedef u64 metadata_ptr_t;
    typedef std::pair<data_ptr_t, data_ptr_t> mem_range_t;
 
+   typedef enum mem_object{
+     VIEW_NODE = 0,
+     MEMORY_BLOCK = 1,
+     INIT_TYPE = 2
+   } mem_object_t;
+
    struct MemoryBlock {
      u64 block_id;
      torch_monitor_device_type_t device_type;
@@ -97,7 +104,7 @@ namespace redshow {
    void register_memory_block(u64 block_id, torch_monitor_device_type_t device_type, void* ptr, int64_t size, int64_t total_allocated, int64_t total_reserved){
      MemoryBlock* _memory_block = new MemoryBlock(block_id, device_type, reinterpret_cast<data_ptr_t>(ptr), size, total_allocated, total_reserved);
      _allocated_mem_blocks.push_back(_memory_block);
-     std::cout << "Total Blocks after registration: " << _allocated_mem_blocks.size() << std::endl;
+     // std::cout << "Total Blocks after registration: " << _allocated_mem_blocks.size() << std::endl;
    }
 
    void unregister_memory_block(void* ptr){
@@ -108,7 +115,7 @@ namespace redshow {
          break;
        }
      }
-     std::cout << "Total Blocks after free: " << _allocated_mem_blocks.size() << std::endl;
+     // std::cout << "Total Blocks after free: " << _allocated_mem_blocks.size() << std::endl;
    }
 
    std::vector<MemoryBlock*> get_mem_block_by_mem_addr(u64 mem_addr_hit) {
@@ -222,6 +229,7 @@ namespace redshow {
      int64_t index;  // arg index in torch-monitor callback inputs list
      size_t num_states;
      torch_monitor_python_state_t py_state[MAX_NUM_STATES];
+     mem_object_t object_type = INIT_TYPE;
      std::vector<u64> ctx_id;
 
      PyStateCTX(int64_t index, size_t num_states, torch_monitor_python_state_t (&arg_py_state)[MAX_NUM_STATES]):
@@ -237,6 +245,8 @@ namespace redshow {
      };
 
      PyStateCTX(){};
+
+     ~PyStateCTX(){};
    };
 
    std::vector<ViewNode*> _roots = {};  // The node forest //TODO: optimize
@@ -263,7 +273,7 @@ namespace redshow {
    *    1.2. in the branch: do nothing here. _total_access will be added by elsewhere when (mem_rw/view_offset) is captured. (TODO)
    * 2. else, create a root node
    * */
-   void update_view_forest(torch_monitor_callback_tensor_data_t& tensor_data, u64 global_id) {
+   void update_view_forest(torch_monitor_callback_tensor_data_t& tensor_data, u64 global_id, bool is_domain_enter) {
      lock();
 
      data_ptr_t data_ptr = (data_ptr_t)tensor_data.data_ptr;
@@ -277,10 +287,11 @@ namespace redshow {
          if (view_existed)
            break;
        }
-       if (view_existed) {
+       if (view_existed && is_domain_enter) {
          // Update Python State
-//         PyStateCTX _state{tensor_data.index, num_states, python_states};
-//         call_path_map[view_existed->view_id].push_back(_state);
+         PyStateCTX _state{tensor_data.index, num_states, python_states};
+         _state.object_type = VIEW_NODE;
+         call_path_map[view_existed->view_id].push_back(_state);
        } else { // found the view node in the forest
          /** insert new view node into correct "view_node._children"
            * 1. find the father node from the root/branch
@@ -314,6 +325,7 @@ namespace redshow {
              _input_view->_children.push_back(_node);
              call_path_map[global_id] = std::vector<PyStateCTX>();
              PyStateCTX _state{tensor_data.index, num_states, python_states};
+             _state.object_type = VIEW_NODE;
              call_path_map[global_id].push_back(_state);
              break;
            }
@@ -326,6 +338,7 @@ namespace redshow {
        _roots.push_back(_root_node_ptr);
        call_path_map[global_id] = std::vector<PyStateCTX>();
        PyStateCTX _state{tensor_data.index, num_states, python_states};
+       _state.object_type = VIEW_NODE;
        call_path_map[global_id].push_back(_state);
      } // add a new root
      unlock();
