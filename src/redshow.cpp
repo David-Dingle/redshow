@@ -221,7 +221,7 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
               if (titer.index == -1 || titer.numel <= 0)
                 continue;
               u64 view_id = update_op_id_func();
-              analysis_ptr->update_view_forest(titer, view_id);  // update the view forest
+              analysis_ptr->update_view_forest(titer, view_id, true);  // update the view forest
             }
           }
         }  // ends stack operation
@@ -315,7 +315,7 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
               if (titer.index == -1 || titer.numel <= 0)
                 continue;
               u64 view_id = update_op_id_func();
-              analysis_ptr->update_view_forest(titer, view_id);  // update the view forest
+              analysis_ptr->update_view_forest(titer, view_id, true);  // update the view forest
             }
             analysis_ptr->_op_stack.pop();
           }
