@@ -209,13 +209,17 @@ namespace redshow {
         return this->_children.empty();
       }
 
-      void delete_children_nodes() {
+      void delete_children_nodes(std::ofstream& out) {
         if (! this->is_leaf_node()) {
+          out << this->view_id << ": {" << '\n';
           for (auto child : this->_children) {
-            child->delete_children_nodes();
+            child->delete_children_nodes(out);
             delete child;
           }
+          out << "  }" << this->view_id << '\n';
           this->_children.clear();
+        } else{
+          out << this->view_id << ": {}" << '\n';
         }
       }
    };
@@ -224,11 +228,18 @@ namespace redshow {
    std::stack<torch_monitor_op_data_t> _op_stack_temp = std::stack<torch_monitor_op_data_t>();  // Deprecated
    torch_monitor_op_data_t _popped_op; // = torch_monitor_op_data_t();
 
+  typedef struct python_state {
+    char file_name[512];
+    char function_name[512];
+    size_t function_first_lineno;
+    size_t lineno;
+  } python_state_t;
+
    struct PyStateCTX {
     public:
      int64_t index;  // arg index in torch-monitor callback inputs list
      size_t num_states;
-     torch_monitor_python_state_t py_state[MAX_NUM_STATES];
+     python_state_t py_state[MAX_NUM_STATES];
      mem_object_t object_type = INIT_TYPE;
      std::vector<u64> ctx_id;
 
@@ -237,8 +248,8 @@ namespace redshow {
      {
        ctx_id = std::vector<u64>{};  // init as empty vector
        for (int i = 0; i < (num_states < MAX_NUM_STATES ? num_states : MAX_NUM_STATES); i++){
-         py_state[i].file_name = arg_py_state[i].file_name;
-         py_state[i].function_name = arg_py_state[i].function_name;
+         strcpy(py_state[i].file_name, arg_py_state[i].file_name);
+         strcpy(py_state[i].function_name, arg_py_state[i].function_name);
          py_state[i].function_first_lineno = arg_py_state[i].function_first_lineno;
          py_state[i].lineno = arg_py_state[i].lineno;
        } // TODO(Ding): Verify the correctness of shallow copy
@@ -364,17 +375,20 @@ namespace redshow {
 
    /**
     * delete a tree(gaven a tensor ptr) from the forest
-    *@param mem_start_addr: starting address of memory range
+    * @param mem_start_addr: starting address of memory range
     */
-   void delete_forest_tree(data_ptr_t mem_start_addr, int64_t total_allocated) {
+   void delete_forest_tree(const std::string &output_dir, data_ptr_t mem_start_addr, int64_t total_allocated) {
      lock();
+     std::ofstream out(output_dir + "forest.txt", std::ios::app);
      for (unsigned i = 0; i < _roots.size(); i++) {
        if (_roots.at(i)->mem_block_range.first >= mem_start_addr && _roots.at(i)->mem_block_range.second <= (mem_start_addr + total_allocated)){
-         _roots.at(i)->delete_children_nodes();
+         _roots.at(i)->delete_children_nodes(out);
+         out << '\n';
          _roots.erase(_roots.begin()+i);
          break;
        }
      }
+     out.close();
      unlock();
    }
 

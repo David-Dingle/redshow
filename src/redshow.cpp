@@ -250,10 +250,11 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
         /**
          * remove an entire tree from the view_node forest;
          **/
-        for (auto iter : analysis_enabled){
-          if (iter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
-            std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
-            analysis_ptr->delete_forest_tree((redshow::TorchView::data_ptr_t)callback_data->data.mem_data.ptr,
+        for (auto aiter : analysis_enabled){
+          if (aiter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
+            std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(aiter.second);
+            analysis_ptr->delete_forest_tree(output_dir[aiter.first],
+                                             (redshow::TorchView::data_ptr_t)callback_data->data.mem_data.ptr,
                                              (int64_t)callback_data->data.mem_data.total_allocated);
 //#ifdef DEBUG
 //            for (auto titer : analysis_ptr->_roots){
