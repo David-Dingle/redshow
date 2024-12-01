@@ -61,58 +61,107 @@ namespace redshow {
       // If the kernel is sampled
       return;
     }
+
+    std::map<uint64_t, std::vector<ViewNode*>> _pc_node_cache;
+
+    // STEP 1
+    // Update the call_path_map with _delayed data
     if (_delayed_trace.get() != NULL){ // if the previous kernel view-node mapping is delayed
       /** handle delayed unit access:
        *  1. map unit access to the updated forest
        *  2. if the map miss again, attribute the access to PyTorch Allocator's mem-block
        */
       std::cout << "Delayed " <<  _delayed_trace->access_memory.size() << " memory accesses." << std::endl;
-      for (auto &trace_iter : _delayed_trace->access_memory) {
-        u64 mem_start = trace_iter.first;
-        std::vector<ViewNode*> view_node_hit_mem = get_view_nodes_by_mem_addr(mem_start, true);
-        update_node_total_access(view_node_hit_mem);
-        // Update Call ctc_id to CallPath TODO: use the old python state and then insert ctx_id
-        for (auto viter = view_node_hit_mem.begin(); viter != view_node_hit_mem.end(); viter++){
-          _delayed_trace->python_state.object_type = VIEW_NODE;
-          call_path_map[(*viter)->view_id].push_back(_delayed_trace->python_state);
-          call_path_map[(*viter)->view_id].back().ctx_id.push_back(_trace->access_memory[mem_start]);
-        }
-        std::cout << "Delayed Kernel Access Hits: " << view_node_hit_mem.size() << " View Node(s). :: " << mem_start << std::endl;
-        if(view_node_hit_mem.empty()){
-          std::vector<MemoryBlock*> mem_blocks_hit = get_mem_block_by_mem_addr(mem_start);
-          std::cout << "Memory Block Hit: " << mem_blocks_hit.size() << std::endl;
-          // TODO insert mem_block_id, delayed_Python_state, object_type, and ctx_id in the call_path_map
-          for (auto miter : mem_blocks_hit) {
-            _delayed_trace->python_state.object_type = MEMORY_BLOCK;
-            call_path_map[(*miter).block_id].push_back(_delayed_trace->python_state);
-            call_path_map[(*miter).block_id].back().ctx_id.push_back(_trace->access_memory[mem_start]);
+      for (auto& [pc, m_c] :  _delayed_trace->access_memory) {
+        for (auto& [m, c] : m_c) {
+          u64 mem_start = m;
+          std::vector<ViewNode*> view_node_hit_mem;
+
+          if(_pc_node_cache.find(pc) != _pc_node_cache.end()) {
+            update_node_total_access(_pc_node_cache[pc], pc);
+            continue; // just update access counter, but dont add callpath again and again
+          } else {
+            view_node_hit_mem = get_view_nodes_by_mem_addr(mem_start, true);
+            update_node_total_access(view_node_hit_mem, pc);
+            _pc_node_cache[pc] = view_node_hit_mem;
+          }
+
+          // Update Call ctc_id to CallPath TODO(Done): use the old python state and then insert ctx_id
+          for (auto viter = view_node_hit_mem.begin(); viter != view_node_hit_mem.end(); viter++){
+            _delayed_trace->python_state.object_type = VIEW_NODE;
+            call_path_map[(*viter)->view_id].push_back(_delayed_trace->python_state);
+            // if (call_path_map[(*viter)->view_id].back().num_states == 0) {
+            //   PyStateCTX _state{-1, num__delayed_states, delayed_python_states};
+            //   call_path_map[(*viter)->view_id].pop_back();
+            //   call_path_map[(*viter)->view_id].push_back(_state);
+            // }
+            call_path_map[(*viter)->view_id].back().ctxid_pcs[c].push_back(pc);
+          }
+          std::cout << "Delayed Kernel Access Hits: " << view_node_hit_mem.size() << " View Node(s). :: " << mem_start << std::endl;
+          if(view_node_hit_mem.empty()){
+            std::vector<MemoryBlock*> mem_blocks_hit = get_mem_block_by_mem_addr(mem_start);
+            std::cout << "Memory Block Hit: " << mem_blocks_hit.size() << std::endl;
+            // TODO insert mem_block_id, delayed_Python_state, object_type, and ctx_id in the call_path_map
+            for (auto miter : mem_blocks_hit) {
+              _delayed_trace->python_state.object_type = MEMORY_BLOCK;
+              call_path_map[(*miter).block_id].push_back(_delayed_trace->python_state);
+              // if (call_path_map[(*miter).block_id].back().num_states == 0) {
+              //   PyStateCTX _state{-1, num__delayed_states, delayed_python_states};
+              //   call_path_map[(*miter).block_id].pop_back();
+              //   call_path_map[(*miter).block_id].push_back(_state);
+              // }
+              call_path_map[(*miter).block_id].back().ctxid_pcs[c].push_back(pc);
+            }
           }
         }
       }
-      _delayed_trace = NULL; // reset delayed trace to NULL
     }
+
+    // STEP 2
+    // Initialize the the _delay_trace table
+    _delayed_trace = NULL; // reset delayed trace to NULL
     if (!_delayed_trace) {
       _delayed_trace = std::make_shared<TorchViewDelayedTrace>();
       // TODO(): assign current Python State to it's field for delayed useage
       PyStateCTX _state{-1, num_states, python_states};
       _delayed_trace->python_state = _state;
     }
+
+    // STEP 3
+    // Normal update on call_path_map
     std::cout << "We Got " <<  _trace->access_memory.size() << " memory accesses." << std::endl;
-    for (auto &trace_iter : _trace->access_memory) {
-      u64 mem_start = trace_iter.first;
-      std::vector<ViewNode*> view_node_hit_mem = get_view_nodes_by_mem_addr(mem_start);
-      update_node_total_access(view_node_hit_mem);
-      // Update Call ctc_id to CallPath
-      for (auto viter = view_node_hit_mem.begin(); viter != view_node_hit_mem.end(); viter++){
-        call_path_map[(*viter)->view_id].back().ctx_id.push_back(op->ctx_id);
-      } // TODO need to be tested
-      std::cout << "Kernel Access Hits: " << view_node_hit_mem.size() << " View Node(s). :: " << mem_start << std::endl;
-      if (view_node_hit_mem.empty()){
-        if (!_delayed_trace->access_memory.has(trace_iter.first)) {
-          _delayed_trace->access_memory.emplace(trace_iter.first, op->ctx_id);
+
+    _pc_node_cache.clear();
+
+    for (auto & [pc, m_c] : _trace->access_memory) {
+      for (auto & [m, c] : m_c) {  // m is real mem_start addr, c is 0 place holder. Use op->ctx_id instead
+        u64 mem_start = m;
+        std::vector<ViewNode*> view_node_hit_mem;
+
+        if(_pc_node_cache.find(pc) != _pc_node_cache.end()) {
+          update_node_total_access(_pc_node_cache[pc], pc);
+          continue; // just update access counter, but dont add callpath again and again
+        } else {
+          view_node_hit_mem = get_view_nodes_by_mem_addr(mem_start, false);
+          update_node_total_access(view_node_hit_mem, pc);
+          _pc_node_cache[pc] = view_node_hit_mem;
+        }
+
+        // Update Call ctc_id to CallPath
+        for (auto viter = view_node_hit_mem.begin(); viter != view_node_hit_mem.end(); viter++){
+          call_path_map[(*viter)->view_id].back().ctxid_pcs[op->ctx_id].push_back(pc);
+        } // TODO need to be tested
+        std::cout << "Kernel Access Hits: " << view_node_hit_mem.size() << " View Node(s). :: " << mem_start << std::endl;
+        if (view_node_hit_mem.empty()){
+          // if (!_delayed_trace->access_memory.has(pc)) {
+          if (true) {
+            _delayed_trace->access_memory[pc].emplace(mem_start, op->ctx_id);
+          }
         }
       }
     }
+
+
     std::cout << "Will delay mem size: " << _delayed_trace->access_memory.size() << std::endl;
     // check if any unit access has been delayed
     if(_delayed_trace->access_memory.empty()){
@@ -140,24 +189,24 @@ namespace redshow {
       std::cout << "memcpy hit: " << view_node_hit_src.size() << " " <<
                                      view_node_hit_dst.size() << " " <<
                                      view_node_hit_shadow.size() << " view nodes." << std::endl;
-      update_node_total_access(view_node_hit_src);
-      update_node_total_access(view_node_hit_dst);
-      update_node_total_access(view_node_hit_shadow);
+      update_node_total_access(view_node_hit_src, 0);
+      update_node_total_access(view_node_hit_dst, 0);
+      update_node_total_access(view_node_hit_shadow, 0);
 
       // TODO update call_path_map
       if(!view_node_hit_src.empty()) {
         for (auto viter: view_node_hit_src) {
-          call_path_map[(*viter).view_id].back().ctx_id.push_back(op->ctx_id);
+          call_path_map[(*viter).view_id].back().ctxid_pcs[op->ctx_id].push_back(0);
         }
       }
       if(!view_node_hit_dst.empty()) {
         for (auto viter: view_node_hit_dst) {
-          call_path_map[(*viter).view_id].back().ctx_id.push_back(op->ctx_id);
+          call_path_map[(*viter).view_id].back().ctxid_pcs[op->ctx_id].push_back(0);
         }
       }
       if(!view_node_hit_shadow.empty()) {
         for (auto viter: view_node_hit_shadow) {
-          call_path_map[(*viter).view_id].back().ctx_id.push_back(op->ctx_id);
+          call_path_map[(*viter).view_id].back().ctxid_pcs[op->ctx_id].push_back(0);
         }
       }
     }
@@ -175,17 +224,17 @@ namespace redshow {
 
       std::cout << "memset hit: " << view_node_hit_start.size() << " " <<
                                      view_node_hit_shadow.size() << " view nodes." << std::endl;
-      update_node_total_access(view_node_hit_start);
-      update_node_total_access(view_node_hit_shadow);
+      update_node_total_access(view_node_hit_start, 0);
+      update_node_total_access(view_node_hit_shadow, 0);
 
       if(!view_node_hit_start.empty()){
         for (auto viter : view_node_hit_start) {
-          call_path_map[(*viter).view_id].back().ctx_id.push_back(op->ctx_id);
+          call_path_map[(*viter).view_id].back().ctxid_pcs[op->ctx_id].push_back(0);
         }
       }
       if(!view_node_hit_shadow.empty()){
         for (auto viter : view_node_hit_shadow) {
-          call_path_map[(*viter).view_id].back().ctx_id.push_back(op->ctx_id);
+          call_path_map[(*viter).view_id].back().ctxid_pcs[op->ctx_id].push_back(0);
         }
       }
     }
@@ -203,10 +252,13 @@ namespace redshow {
     if (!_trace) {
       _trace = std::make_shared<TorchViewTrace>();
     }
+    std::cout << "analysis_begin Kernel ID: " << std::hex << kernel_id << std::dec << std::endl;
     unlock();
   }
 
-  void TorchView::analysis_end(u32 cpu_thread, i32 kernel_id) {}
+  void TorchView::analysis_end(u32 cpu_thread, i32 kernel_id) {
+    std::cout << "analysis_end Kernel ID: " << std::hex << kernel_id << std::dec << std::endl;
+  }
 
   void TorchView::block_enter(const ThreadId &thread_id) {
     // No operation
@@ -219,9 +271,11 @@ namespace redshow {
   void TorchView::unit_access(i32 kernel_id, u64 host_op_id, const ThreadId &thread_id,
                                  const AccessKind &access_kind, const Memory &memory, u64 pc,
                                  u64 value, u64 addr, u32 index, GPUPatchFlags flags) {
-    std::cout << "ENTER TORCH VIEW UNIT ACCESS: " << memory.memory_range.start << std::endl;
-    if (!_trace->access_memory.has(memory.memory_range.start)) {
-      _trace->access_memory.emplace(memory.memory_range.start, 0); // 0 placeholder;
+    // std::cout << "ENTER TORCH VIEW UNIT ACCESS: " << memory.memory_range.start << " : " << pc << std::endl;
+    if (true) { 
+      std::cout << "pc: " << std::hex << pc << " mem: " << memory.memory_range.start << std::dec << std::endl;
+    // if (!_trace->access_memory.has(pc)) {
+      _trace->access_memory[pc].emplace(memory.memory_range.start, 0); // 0 placeholder;
     }
   }
 
@@ -235,12 +289,72 @@ namespace redshow {
  * new version
  * */
   {
+    std::map<uint64_t, std::vector<ViewNode*>> _pc_node_cache;
+
+    // Update the call_path_map with _delayed data
+    if (_delayed_trace.get() != NULL){ // if the previous kernel view-node mapping is delayed
+      /** handle delayed unit access:
+       *  1. map unit access to the updated forest
+       *  2. if the map miss again, attribute the access to PyTorch Allocator's mem-block
+       */
+      std::cout << "Delayed " <<  _delayed_trace->access_memory.size() << " memory accesses." << std::endl;
+      for (auto& [pc, m_c] :  _delayed_trace->access_memory) {
+        for (auto& [m, c] : m_c) {
+          u64 mem_start = m;
+          std::vector<ViewNode*> view_node_hit_mem;
+
+          if(_pc_node_cache.find(pc) != _pc_node_cache.end()) {
+            update_node_total_access(_pc_node_cache[pc], pc);
+            continue; // just update access counter, but dont add callpath again and again
+          } else {
+            view_node_hit_mem = get_view_nodes_by_mem_addr(mem_start, true);
+            update_node_total_access(view_node_hit_mem, pc);
+            _pc_node_cache[pc] = view_node_hit_mem;
+          }
+
+          // Update Call ctc_id to CallPath TODO(Done): use the old python state and then insert ctx_id
+          for (auto viter = view_node_hit_mem.begin(); viter != view_node_hit_mem.end(); viter++){
+            _delayed_trace->python_state.object_type = VIEW_NODE;
+            call_path_map[(*viter)->view_id].push_back(_delayed_trace->python_state);
+            // if (call_path_map[(*viter)->view_id].back().num_states == 0) {
+            //   PyStateCTX _state{-1, num__delayed_states, delayed_python_states};
+            //   call_path_map[(*viter)->view_id].pop_back();
+            //   call_path_map[(*viter)->view_id].push_back(_state);
+            // }
+            call_path_map[(*viter)->view_id].back().ctxid_pcs[c].push_back(pc);
+          }
+          std::cout << "Delayed Kernel Access Hits: " << view_node_hit_mem.size() << " View Node(s). :: " << mem_start << std::endl;
+          if(view_node_hit_mem.empty()){
+            std::vector<MemoryBlock*> mem_blocks_hit = get_mem_block_by_mem_addr(mem_start);
+            std::cout << "Memory Block Hit: " << mem_blocks_hit.size() << std::endl;
+            // TODO insert mem_block_id, delayed_Python_state, object_type, and ctx_id in the call_path_map
+            for (auto miter : mem_blocks_hit) {
+              _delayed_trace->python_state.object_type = MEMORY_BLOCK;
+              call_path_map[(*miter).block_id].push_back(_delayed_trace->python_state);
+              // if (call_path_map[(*miter).block_id].back().num_states == 0) {
+              //   PyStateCTX _state{-1, num__delayed_states, delayed_python_states};
+              //   call_path_map[(*miter).block_id].pop_back();
+              //   call_path_map[(*miter).block_id].push_back(_state);
+              // }
+              call_path_map[(*miter).block_id].back().ctxid_pcs[c].push_back(pc);
+            }
+          }
+        }
+      }
+    }
+
+    // lock();
     std::ofstream out(output_dir + "torch_view_report.csv");
 
     for(auto iter = call_path_map.begin(); iter != call_path_map.end(); iter++){
       out << "id " << iter->first << std::endl;
       out << "python_state " << std::endl; // Python StateS begin
       for(auto siter = iter->second.begin(); siter != iter->second.end(); siter++){
+        // skip states with no ctx info
+        if(siter->ctxid_pcs.empty()) {
+          continue;
+        }
+        // end skip states with no ctx info
         out << "index " << siter->index << std::endl;
         out << "num_states " << siter->num_states << std::endl;
         out << "py_state " << std::endl; // py_state begin
@@ -251,7 +365,7 @@ namespace redshow {
           out << "function_first_lineno "<< siter->py_state[i].function_first_lineno << std::endl;
           out << "lineno "<< siter->py_state[i].lineno << std::endl;
         }
-// start
+       // start
         std::string all_states("");
         for(size_t i = 0; i < state_length; i++) {
           all_states.append(siter->py_state[i].file_name);
@@ -260,11 +374,17 @@ namespace redshow {
           all_states.append(std::to_string(siter->py_state[i].lineno));
         }
         out << "pytates_hash " << (std::size_t)std::hash<std::string>{}(all_states) << std::endl;
-// end
+        // end
         out << "object_type " << (int)siter->object_type << std::endl;
-        out << "ctx_id " << std::endl; // ctx_id begin
-        for(auto citer = siter->ctx_id.begin(); citer != siter->ctx_id.end(); citer++){
-          out << (*citer) << std::endl;
+        for(auto& [ctx_id, pc_s] : siter->ctxid_pcs){
+          // out << "ctx_id " << std::endl; // ctx_id begin
+          // out << ctx_id << std::endl;
+          for(auto& pc : pc_s) {
+            out << "ctx_id " << std::endl; // ctx_id begin
+            out << ctx_id << std::endl;
+            out << "pc " << std::endl;
+            out << pc << std::endl;
+          }
         }
         out << std::endl;
       }
@@ -278,9 +398,12 @@ namespace redshow {
       for (unsigned i = 0; i < _roots.size(); i++) {
         _roots.at(i)->delete_children_nodes(fout);
         fout << '\n';
+        _roots.erase(_roots.begin()+i);
+        --i;
       }
       fout.close();
     }
+    // unlock();
   }
 
 }  // namespace redshow

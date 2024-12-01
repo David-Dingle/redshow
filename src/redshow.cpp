@@ -206,6 +206,13 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
       }
       if (true) { //python_state_enable) {
         // python_state_report();
+        // num__delayed_states = num_states;
+        // for(size_t i = 0; i < num_states; i++) {
+        //   strcpy(delayed_python_states[i].file_name, python_states[i].file_name);
+        //   strcpy(delayed_python_states[i].function_first_lineno, python_states[i].function_first_lineno);
+        //   delayed_python_states[i].function_name = python_states[i].function_name;
+        //   delayed_python_states[i].lineno = python_states[i].lineno;
+        // } // ready for delayed pystate insertion
         torch_monitor_python_state_get(MAX_NUM_STATES, python_states, &num_states);
       }
       if (torch_monitor_inputs_capture_enable_get()) {
@@ -366,7 +373,8 @@ static redshow_result_t analyze_cubin(const char *path, SymbolVector &symbols,
   return result;
 }
 
-static redshow_result_t trace_analyze_address_patch(int32_t kernel_id, u64 host_op_id, MemoryMap *memory_map,
+static redshow_result_t trace_analyze_address_patch(int32_t kernel_id, u64 host_op_id, InstructionGraph *inst_graph,
+                                                    SymbolVector *symbols, MemoryMap *memory_map,
                                                     gpu_patch_buffer_t *trace_data) {
   redshow_result_t result = REDSHOW_SUCCESS;
 
@@ -417,10 +425,23 @@ static redshow_result_t trace_analyze_address_patch(int32_t kernel_id, u64 host_
       // only for memory profile heatmap storage compression
       access_kind.unit_size = record->size;
 
+      // start get pc
+      RealPC real_pc;
+
+      auto ret = symbols->transform_pc(record->pc);
+      if (ret.has_value()) {
+        real_pc = ret.value();
+        // std::cout << "Symbol.index: " << real_pc.function_index << std::endl;
+      } else {
+        result = REDSHOW_ERROR_FAILED_ANALYZE_CUBIN;
+        return result;
+      }
+      // end get pc
+
       Memory memory = Memory(memory_op_id, memory_id, memory_addr, memory_size);
       // XXX(Keren): Need to separate address analysis with value analysis
       for (auto aiter : analysis_enabled) {
-        aiter.second->unit_access(kernel_id, host_op_id, thread_id, access_kind, memory, 0, 0, 0, 0,
+        aiter.second->unit_access(kernel_id, host_op_id, thread_id, access_kind, memory, real_pc.pc_offset, 0, 0, 0,
                                   static_cast<GPUPatchFlags>(record->flags));
       }
     }
@@ -734,7 +755,7 @@ static redshow_result_t trace_analyze(uint32_t cpu_thread, uint32_t cubin_id, ui
   if (trace_data->type == GPU_PATCH_TYPE_DEFAULT) {
     result = trace_analyze_default(kernel_id, host_op_id, inst_graph, symbols, memory_map, trace_data);
   } else if (trace_data->type == GPU_PATCH_TYPE_ADDRESS_PATCH) {
-    result = trace_analyze_address_patch(kernel_id, host_op_id, memory_map, trace_data);
+    result = trace_analyze_address_patch(kernel_id, host_op_id, inst_graph, symbols, memory_map, trace_data);
   } else if (trace_data->type == GPU_PATCH_TYPE_ADDRESS_ANALYSIS) {
     result = trace_analyze_address_analysis(kernel_id, host_op_id, memory_map, trace_data);
   }

@@ -38,7 +38,9 @@
 
 const static size_t MAX_NUM_STATES = 30;
 thread_local static size_t num_states;
+thread_local static size_t num__delayed_states;
 thread_local static torch_monitor_python_state_t python_states[MAX_NUM_STATES];
+thread_local static torch_monitor_python_state_t delayed_python_states[MAX_NUM_STATES];
 
 namespace redshow {
 
@@ -142,7 +144,7 @@ namespace redshow {
      data_ptr_t data_ptr;
      metadata_ptr_t metadata_ptr;
      mem_range_t mem_block_range;  // <block start, block end>
-     int _total_access = 0;
+     std::map<uint64_t, uint64_t> pc_access; // int _total_access = 0;
      std::vector<ViewNode*> _children = {};
 
      public:
@@ -211,7 +213,14 @@ namespace redshow {
 
       void delete_children_nodes(std::ofstream& out) {
         if (! this->is_leaf_node()) {
-          out << this->view_id << ": {" << '\n';
+          out << this->view_id << ": { " ;
+          out << this->data_ptr << " ";
+          if (this->pc_access.size() > 0){
+            for(auto& [pc, access] : this->pc_access) {
+              out << " " << std::hex << pc << std::dec << ":" << access;
+            }
+          }
+          out << "\n";
           for (auto child : this->_children) {
             child->delete_children_nodes(out);
             delete child;
@@ -219,7 +228,14 @@ namespace redshow {
           out << "  }" << this->view_id << '\n';
           this->_children.clear();
         } else{
-          out << this->view_id << ": {}" << '\n';
+          out << this->view_id << ": {";
+          out << this->data_ptr << " ";
+          if (this->pc_access.size() > 0){
+            for(auto& [pc, access] : this->pc_access) {
+              out << " " << std::hex << pc << std::dec << ":" << access;
+            }
+          }
+          out << " }\n";
         }
       }
    };
@@ -241,12 +257,12 @@ namespace redshow {
      size_t num_states;
      python_state_t py_state[MAX_NUM_STATES];
      mem_object_t object_type = INIT_TYPE;
-     std::vector<u64> ctx_id;
+     std::map<u64, std::vector<u64>> ctxid_pcs = std::map<u64, std::vector<u64>>{};  // std::map<u64, std::vector<u64>>
 
      PyStateCTX(int64_t index, size_t num_states, torch_monitor_python_state_t (&arg_py_state)[MAX_NUM_STATES]):
        index(index), num_states(num_states)
      {
-       ctx_id = std::vector<u64>{};  // init as empty vector
+      //  ctxid_pcs = std::vector<u64>{};  // init as empty vector
        for (int i = 0; i < (num_states < MAX_NUM_STATES ? num_states : MAX_NUM_STATES); i++){
          strcpy(py_state[i].file_name, arg_py_state[i].file_name);
          strcpy(py_state[i].function_name, arg_py_state[i].function_name);
@@ -362,7 +378,7 @@ namespace redshow {
    void visualize_view_forest(ViewNode* root, int indent_level = 0, const char* indent = "    |"){
      for (int i = 0; i < indent_level; i++)
        std::cout << indent;
-     std::cout << "ID: " << root->view_id << " D_ptr: " << root->data_ptr << " numel: " << root->numel << " dim: " << root->dim << " M_ptr: " << root->metadata_ptr << " Range_f: " << root->mem_block_range.first << " Range_s: " << root->mem_block_range.second << " Access: " << root->_total_access;
+     std::cout << "ID: " << root->view_id << " D_ptr: " << root->data_ptr << " numel: " << root->numel << " dim: " << root->dim << " M_ptr: " << root->metadata_ptr << " Range_f: " << root->mem_block_range.first << " Range_s: " << root->mem_block_range.second << " Access_PCs: " << root->pc_access.size();
      if (!root->_children.empty()){
        for (ViewNode* citer : root->_children) {
          visualize_view_forest(citer, indent_level + 1, indent);
@@ -385,7 +401,7 @@ namespace redshow {
          _roots.at(i)->delete_children_nodes(out);
          out << '\n';
          _roots.erase(_roots.begin()+i);
-         break;
+         --i; //break;
        }
      }
      out.close();
@@ -397,7 +413,7 @@ namespace redshow {
     * @param a list of view_nodes
     * TODO: call this func at project stage 3, (use data_ptr, offset, stride, itemsize to spot the view_node which needs update)
     */
-   void update_node_total_access(std::vector<ViewNode*> view_nodes) {
+   void update_node_total_access(std::vector<ViewNode*> view_nodes, uint64_t pc) {
      // lock(); // TODO: Try fix later: another lock; Or try to make it sequential
      for (auto viter : view_nodes) {
        std::vector<ViewNode*> _root_node = find_root_node(*viter);
@@ -410,7 +426,11 @@ namespace redshow {
          if (_node)
            break;
        }
-       _node->_total_access++;
+       if(_node->pc_access.find(pc) != _node->pc_access.end()) {
+         _node->pc_access[pc]++;
+       } else {
+        _node->pc_access[pc] = 1;
+       }
      }
      // unlock();
    }
@@ -515,9 +535,10 @@ namespace redshow {
      if (!is_delay) {
        torch_monitor_op_data_t op_info = _op_stack.top();
        torch_monitor_input_output_data_t inputs = op_info.input_output_data;
+       std::cout << "op stack total tensor size: " << inputs.size << std::endl;
        for (int64_t i = 0; i < inputs.size; i++) {
          torch_monitor_callback_tensor_data_t _tensor = inputs.tensor_data[i];
-         std::cout << "op stack tensor data ptr: " << (u64) _tensor.data_ptr << std::endl;
+         std::cout << "op stack tensor data ptr: " << std::hex << (u64) _tensor.data_ptr << std::dec << std::endl;
          if (_tensor.index == -1 || _tensor.numel <= 0)
            continue;
          data_ptr_t _tensor_data_ptr = reinterpret_cast<data_ptr_t>(_tensor.data_ptr);
@@ -619,7 +640,7 @@ namespace redshow {
      // u64: Memory:Operation->op_id
      // don't care about read or write in this mode, just need to know access or not
      // PyStateCTX python_state;
-     Map<u64, i32> access_memory; // map with sort but vector not
+     Map<u64, Map<u64, u64>> access_memory; // Map<pc, Map<mem_start, ctx_id>>
 
      TorchViewTrace() = default;
 
@@ -632,7 +653,7 @@ namespace redshow {
       // u64: Memory:Operation->op_id
       // don't care about read or write in this mode, just need to know access or not
       PyStateCTX python_state;
-      Map<u64, i32> access_memory; // map with sort but vector not
+      Map<u64, Map<u64, u64>> access_memory; // map with sort but vector not
 
       TorchViewDelayedTrace() = default;
 
