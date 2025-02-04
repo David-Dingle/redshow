@@ -123,8 +123,21 @@ namespace redshow {
     if (!_delayed_trace) {
       _delayed_trace = std::make_shared<TorchViewDelayedTrace>();
       // TODO(): assign current Python State to it's field for delayed useage
-      PyStateCTX _state{-1, num_states, python_states};
-      _delayed_trace->python_state = _state;
+      if(num_states > 0){
+        PyStateCTX _state{-1, num_states, python_states};
+        _delayed_trace->python_state = _state;
+      } else {
+        torch_monitor_python_state_get(MAX_NUM_STATES, delayed_python_states, &num__delayed_states);
+        PyStateCTX _state{-1, num__delayed_states, delayed_python_states};
+        if (num__delayed_states > 0) {
+         if (!_domain_name.empty()) {
+           strcat(_state.py_state[0].function_name, "^");
+           strcat(_state.py_state[0].function_name, _domain_name.top().c_str());
+         }
+        }
+        // std::cout << "num__delayed_states: " << num__delayed_states << std::endl;
+        _delayed_trace->python_state = _state;
+      }
     }
 
     // STEP 3
@@ -272,9 +285,9 @@ namespace redshow {
                                  const AccessKind &access_kind, const Memory &memory, u64 pc,
                                  u64 value, u64 addr, u32 index, GPUPatchFlags flags) {
     // std::cout << "ENTER TORCH VIEW UNIT ACCESS: " << memory.memory_range.start << " : " << pc << std::endl;
-    if (true) { 
+    // if (true) { 
       std::cout << "pc: " << std::hex << pc << " mem: " << memory.memory_range.start << std::dec << std::endl;
-    // if (!_trace->access_memory.has(pc)) {
+    if (!_trace->access_memory.has(pc)) {
       _trace->access_memory[pc].emplace(memory.memory_range.start, 0); // 0 placeholder;
     }
   }
@@ -351,9 +364,9 @@ namespace redshow {
       out << "python_state " << std::endl; // Python StateS begin
       for(auto siter = iter->second.begin(); siter != iter->second.end(); siter++){
         // skip states with no ctx info
-        if(siter->ctxid_pcs.empty()) {
-          continue;
-        }
+        // if(siter->ctxid_pcs.empty()) {
+        //   continue;
+        // }
         // end skip states with no ctx info
         out << "index " << siter->index << std::endl;
         out << "num_states " << siter->num_states << std::endl;
@@ -366,10 +379,21 @@ namespace redshow {
           out << "lineno "<< siter->py_state[i].lineno << std::endl;
         }
        // start
+        std::string fitst_filename;
         std::string all_states("");
+        if (state_length > 0) {
+          const size_t last_slash_idx = std::string(siter->py_state[0].function_name).rfind('^');
+          if (std::string::npos != last_slash_idx) {
+            fitst_filename = std::string(siter->py_state[0].function_name).substr(0, last_slash_idx);
+          }
+        }
         for(size_t i = 0; i < state_length; i++) {
           all_states.append(siter->py_state[i].file_name);
-          all_states.append(siter->py_state[i].function_name);
+          if (i == 0 && fitst_filename.length() > 0) {
+            all_states.append(fitst_filename);
+          } else {
+            all_states.append(siter->py_state[i].function_name);
+          }
           all_states.append(std::to_string(siter->py_state[i].function_first_lineno));
           all_states.append(std::to_string(siter->py_state[i].lineno));
         }

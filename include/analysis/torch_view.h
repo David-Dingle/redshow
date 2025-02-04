@@ -241,8 +241,10 @@ namespace redshow {
    };
 
    std::stack<torch_monitor_op_data_t> _op_stack = std::stack<torch_monitor_op_data_t>();
+   std::stack<std::string> _domain_name = std::stack<std::string>();
    std::stack<torch_monitor_op_data_t> _op_stack_temp = std::stack<torch_monitor_op_data_t>();  // Deprecated
    torch_monitor_op_data_t _popped_op; // = torch_monitor_op_data_t();
+   std::string _popped_domain_name;
 
   typedef struct python_state {
     char file_name[512];
@@ -317,6 +319,12 @@ namespace redshow {
        if (view_existed && is_domain_enter) {
          // Update Python State
          PyStateCTX _state{tensor_data.index, num_states, python_states};
+         if (!_domain_name.empty()) {
+           if (num_states > 0) {
+             strcat(_state.py_state[0].function_name, "^");
+             strcat(_state.py_state[0].function_name, _domain_name.top().c_str());
+           }
+         }
          _state.object_type = VIEW_NODE;
          call_path_map[view_existed->view_id].push_back(_state);
        } else { // found the view node in the forest
@@ -352,9 +360,18 @@ namespace redshow {
              _input_view->_children.push_back(_node);
              call_path_map[global_id] = std::vector<PyStateCTX>();
              PyStateCTX _state{tensor_data.index, num_states, python_states};
+             if (!_domain_name.empty()) {
+               if (num_states > 0) {
+                 strcat(_state.py_state[0].function_name, "^");
+                 strcat(_state.py_state[0].function_name, _domain_name.top().c_str());
+               }
+             }
              _state.object_type = VIEW_NODE;
              call_path_map[global_id].push_back(_state);
              break;
+            //  _state.object_type = VIEW_NODE;
+            //  call_path_map[global_id].push_back(_state);
+            //  break;
            }
          }
        }
@@ -365,8 +382,16 @@ namespace redshow {
        _roots.push_back(_root_node_ptr);
        call_path_map[global_id] = std::vector<PyStateCTX>();
        PyStateCTX _state{tensor_data.index, num_states, python_states};
+       if (!_domain_name.empty()) {
+         if (num_states > 0) {
+           strcat(_state.py_state[0].function_name, "^");
+           strcat(_state.py_state[0].function_name, _domain_name.top().c_str());
+         }
+       }
        _state.object_type = VIEW_NODE;
        call_path_map[global_id].push_back(_state);
+      //  _state.object_type = VIEW_NODE;
+      //  call_path_map[global_id].push_back(_state);
      } // add a new root
      unlock();
    }
@@ -483,9 +508,9 @@ namespace redshow {
        } else { // sit < mem_addr_hit
          if ((sit + itemsize * stride) > mem_addr_hit) {
            return sit;
-         } else {
+         } else if (stride != 0) {
            return find_local_starting_address((sit + itemsize * stride), (size - (size / 2)), stride, itemsize, mem_addr_hit);
-         }
+         } else {return sit;}
        }
      } else {
        return 0;
