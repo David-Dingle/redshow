@@ -178,10 +178,10 @@ static void torch_callback_inputs_outputs_report(torch_monitor_callback_site_t c
 }
 
 static void python_state_report() {
+#ifdef DEBUG
   size_t num_states = 0;
   // Allow empty states
   torch_monitor_python_state_get(MAX_NUM_STATES, python_states, &num_states);
-#ifdef DEBUG
   for (size_t i = 0; i < num_states; ++i) {
     std::cout << "(" << i << ") "
               << "File: " << std::string(python_states[i].file_name) << std::endl;
@@ -234,9 +234,9 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
         //   } // ready for delayed pystate insertion
         // }
         torch_monitor_python_state_get(MAX_NUM_STATES, python_states, &num_states);
-        if (num_states > 0) {
-          torch_monitor_python_state_get(MAX_NUM_STATES, delayed_python_states, &num__delayed_states);
-        }
+        // if (num_states > 0) {
+        //   torch_monitor_python_state_get(MAX_NUM_STATES, delayed_python_states, &num__delayed_states);
+        // }
       }
       if (torch_monitor_inputs_capture_enable_get()) {
         /**
@@ -260,7 +260,7 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
         torch_callback_inputs_outputs_report(callback_site, callback_data);
 #endif
       }
-    } else {
+    } else {  // callback_data->domain == TORCH_MONITOR_DOMAIN_MEMORY
 #ifdef DEBUG
       std::cout << "Current thread id: " << callback_data->current_thread_id << std::endl;
 #endif
@@ -326,7 +326,7 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
         std::cout << "Total reserved: " << callback_data->data.mem_data.total_reserved
                   << std::endl;
 #endif
-    }
+    } // end callback_data->domain == TORCH_MONITOR_DOMAIN_MEMORY
   } else if (callback_site == TORCH_MONITOR_CALLBACK_EXIT) {
     if (callback_data->domain != TORCH_MONITOR_DOMAIN_MEMORY) {
       if (true) {  //timestamp_enable) {
@@ -372,13 +372,16 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
           //   analysis_ptr->visualize_view_forest(titer);
           // }
 #endif
+          // clear delayed unit access trace
+          analysis_ptr->map_delayed_access();
+          analysis_ptr->clear_delayed_trace();
         }
       }
 #ifdef DEBUG
       torch_callback_inputs_outputs_report(callback_site, callback_data);
 #endif
     }
-  }
+  } //callback_site == TORCH_MONITOR_CALLBACK_EXIT
 }
 
 static redshow_result_t analyze_cubin(const char *path, SymbolVector &symbols,

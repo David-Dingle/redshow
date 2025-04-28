@@ -245,6 +245,11 @@ namespace redshow {
    std::stack<torch_monitor_op_data_t> _op_stack_temp = std::stack<torch_monitor_op_data_t>();  // Deprecated
    torch_monitor_op_data_t _popped_op; // = torch_monitor_op_data_t();
    std::string _popped_domain_name;
+   bool is_aten_copy_domain = false;
+   std::map<uint64_t, std::map<uint64_t, uint64_t>> device_view_copy_map = std::map<uint64_t, std::map<uint64_t, uint64_t>>();
+   uint64_t aten_copy_pystate_hash = 0;
+   uint64_t aten_copy_tar = 0;
+   uint64_t aten_copy_src = 0;
 
   typedef struct python_state {
     char file_name[512];
@@ -687,7 +692,7 @@ namespace redshow {
 
    std::shared_ptr<TorchViewTrace> _trace;
 
-    std::shared_ptr<TorchViewDelayedTrace> _delayed_trace;
+   std::shared_ptr<TorchViewDelayedTrace> _delayed_trace;
 
    Map<u64, std::shared_ptr<Memory>> _memories;
 
@@ -720,32 +725,75 @@ namespace redshow {
    u64 _submemory_peak = 0;
    u64 _optimal_submemory_peak = 0;
    u64 _submemory_peak_kernel = 0;
+  
+  public:
+   void map_delayed_access(){
+    std::map<uint64_t, std::vector<ViewNode*>> _pc_node_cache;
+    // STEP 1
+    // Update the call_path_map with _delayed data
+    if (_delayed_trace.get() != NULL){ // if the previous kernel view-node mapping is delayed
+      /** handle delayed unit access:
+       *  1. map unit access to the updated forest
+       *  2. if the map miss again, attribute the access to PyTorch Allocator's mem-block
+       */
+      std::cout << "Delayed " <<  _delayed_trace->access_memory.size() << " memory accesses." << std::endl;
+      std::vector<u64> removable_pc = {};
+      for (auto& [pc, m_c] :  _delayed_trace->access_memory) {
+        for (auto& [m, c] : m_c) {
+          u64 mem_start = m;
+          std::vector<ViewNode*> view_node_hit_mem;
+
+          if(_pc_node_cache.find(pc) != _pc_node_cache.end()) {
+            update_node_total_access(_pc_node_cache[pc], pc);
+            continue; // just update access counter, but dont add callpath again and again
+          } else {
+            view_node_hit_mem = get_view_nodes_by_mem_addr(mem_start, true);
+            update_node_total_access(view_node_hit_mem, pc);
+            _pc_node_cache[pc] = view_node_hit_mem;
+          }
+
+          // Update Call ctc_id to CallPath TODO(Done): use the old python state and then insert ctx_id
+          for (auto viter = view_node_hit_mem.begin(); viter != view_node_hit_mem.end(); viter++){
+            _delayed_trace->python_state.object_type = VIEW_NODE;
+            call_path_map[(*viter)->view_id].push_back(_delayed_trace->python_state);
+            // if (call_path_map[(*viter)->view_id].back().num_states == 0) {
+            //   PyStateCTX _state{-1, num__delayed_states, delayed_python_states};
+            //   call_path_map[(*viter)->view_id].pop_back();
+            //   call_path_map[(*viter)->view_id].push_back(_state);
+            // }
+            call_path_map[(*viter)->view_id].back().ctxid_pcs[c].push_back(pc);
+          }
+          std::cout << "Delayed Kernel Access Hits: " << view_node_hit_mem.size() << " View Node(s). :: " << mem_start << std::endl;
+          if(view_node_hit_mem.empty()){
+            std::vector<MemoryBlock*> mem_blocks_hit = get_mem_block_by_mem_addr(mem_start);
+            std::cout << "Memory Block Hit: " << mem_blocks_hit.size() << std::endl;
+            // TODO insert mem_block_id, delayed_Python_state, object_type, and ctx_id in the call_path_map
+            for (auto miter : mem_blocks_hit) {
+              _delayed_trace->python_state.object_type = MEMORY_BLOCK;
+              call_path_map[(*miter).block_id].push_back(_delayed_trace->python_state);
+              // if (call_path_map[(*miter).block_id].back().num_states == 0) {
+              //   PyStateCTX _state{-1, num__delayed_states, delayed_python_states};
+              //   call_path_map[(*miter).block_id].pop_back();
+              //   call_path_map[(*miter).block_id].push_back(_state);
+              // }
+              call_path_map[(*miter).block_id].back().ctxid_pcs[c].push_back(pc);
+            }
+          }
+        }
+        removable_pc.push_back(pc);
+      }
+      for (auto& _pc_to_remove : removable_pc){
+        _delayed_trace->access_memory.erase(_pc_to_remove);
+      }
+    }
+   }
+
+   void clear_delayed_trace() {
+     _delayed_trace = NULL;
+   }
 
 
   private:
-
-
-
-   /**
-    * Call Path from torch-monitor
-    * TODO: find out how to invoke this function
-    * @param op_id
-    */
-//   void update_torch_python_states(u64 op_id) {
-//     size_t num_states = 0;
-//     torch_monitor_python_state_get(MAX_NUM_STATES, python_states, &num_states);
-//     Vector<PythonState> pstates;
-//     for (size_t i = 0; i < num_states; ++i) {
-//       pstates.push_back(
-//         PythonState(
-//           std::string(python_states[i].file_name),
-//           std::string(python_states[i].function_name),
-//           python_states[i].function_first_lineno,
-//           python_states[i].lineno)
-//       );
-//     }
-//     _torch_python_states.try_emplace(op_id, pstates);
-//   }
 
    void update_op_node(u64 op_id, i32 ctx_id);
 
