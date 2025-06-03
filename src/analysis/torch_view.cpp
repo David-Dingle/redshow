@@ -95,7 +95,7 @@ namespace redshow {
           update_node_total_access(_pc_node_cache[pc], pc);
           continue; // just update access counter, but dont add callpath again and again
         } else {
-          view_node_hit_mem = get_view_nodes_by_mem_addr(mem_start, false);
+          view_node_hit_mem = new_get_view_nodes_by_mem_addr(mem_start, false);
           update_node_total_access(view_node_hit_mem, pc);
           _pc_node_cache[pc] = view_node_hit_mem;
         }
@@ -105,7 +105,9 @@ namespace redshow {
           call_path_map[(*viter)->view_id].back().ctxid_pcs[op->ctx_id].push_back(pc);
 
           // if this is a aten::copy_ domain
-          std::cout << "Domain: " << _domain_name.top() << std::endl;
+          if (!_domain_name.empty()) {
+            std::cout << "Domain: " << _domain_name.top() << std::endl;
+          }
           if (is_aten_copy_domain) {
             if (aten_copy_tar == 0 || aten_copy_src == 0) {
               std::string all_states("");
@@ -165,9 +167,9 @@ namespace redshow {
       u64 dst_shadow_start = op->dst_shadow_start;
 
       // (mem_range_t)mem_range{mem_addrs, mem_addrs + op->len};
-      std::vector<ViewNode*> view_node_hit_src = get_view_nodes_by_mem_addr(src_start);
-      std::vector<ViewNode*> view_node_hit_dst = get_view_nodes_by_mem_addr(dst_start);
-      std::vector<ViewNode*> view_node_hit_shadow = get_view_nodes_by_mem_addr(dst_shadow_start);
+      std::vector<ViewNode*> view_node_hit_src = {};// get_view_nodes_by_mem_addr(src_start);
+      std::vector<ViewNode*> view_node_hit_dst = {};// get_view_nodes_by_mem_addr(dst_start);
+      std::vector<ViewNode*> view_node_hit_shadow = {};//get_view_nodes_by_mem_addr(dst_shadow_start);
 
 # ifdef DEBUG
       std::cout << "memcpy hit: " << view_node_hit_src.size() << " " <<
@@ -204,8 +206,8 @@ namespace redshow {
       u64 dst_shadow_start = op->shadow_start;
       u64 value = op->value;
 
-      std::vector<ViewNode*> view_node_hit_start = get_view_nodes_by_mem_addr(start);
-      std::vector<ViewNode*> view_node_hit_shadow = get_view_nodes_by_mem_addr(dst_shadow_start);
+      std::vector<ViewNode*> view_node_hit_start = {}; //get_view_nodes_by_mem_addr(start);
+      std::vector<ViewNode*> view_node_hit_shadow = {}; //get_view_nodes_by_mem_addr(dst_shadow_start);
 
 # ifdef DEBUG
       std::cout << "memset hit: " << view_node_hit_start.size() << " " <<
@@ -229,17 +231,12 @@ namespace redshow {
 
   void TorchView::analysis_begin(u32 cpu_thread, i32 kernel_id, u64 host_op_id, u32 stream_id,
                                 u32 cubin_id, u32 mod_id, GPUPatchType type, void* trace_data) {
-    // configured in sanitizer-api.c:sanitizer_torch_view_analysis_enable()
-//    if(type == GPU_PATCH_TYPE_ADDRESS_ANALYSIS)
-//      return;
     assert(type == GPU_PATCH_TYPE_ADDRESS_PATCH || type == GPU_PATCH_TYPE_ADDRESS_ANALYSIS);
-    // gpu_patch_buffer_t* buffer = static_cast<gpu_patch_buffer_t*>(trace_data);
     lock();
-    // ?? How to make sure this _trace are the same with the _trace in kernel_op_callback
     if (!_trace) {
       _trace = std::make_shared<TorchViewTrace>();
     }
-    if (_domain_name.top().compare("aten::copy_") == 0){
+    if (!_domain_name.empty() && _domain_name.top().compare("aten::copy_") == 0){
       is_aten_copy_domain = true;
       aten_copy_pystate_hash = 0;
       aten_copy_tar = 0;
@@ -256,9 +253,6 @@ namespace redshow {
     std::cout << "analysis_end Kernel ID: " << std::hex << kernel_id << std::dec << std::endl;
 # endif
     if (is_aten_copy_domain == true && aten_copy_src != 0 && aten_copy_src != 0) {
-      // device_view_copy_map[aten_copy_pystate_hash][aten_copy_tar] = aten_copy_src;
-      // std::cout << "kernel end aten_copy_pystate_hash : " <<  aten_copy_pystate_hash << std::endl;
-
       is_aten_copy_domain = false;
       aten_copy_pystate_hash = 0;
       aten_copy_tar = 0;
@@ -277,7 +271,6 @@ namespace redshow {
   void TorchView::unit_access(i32 kernel_id, u64 host_op_id, const ThreadId &thread_id,
                                  const AccessKind &access_kind, const Memory &memory, u64 pc,
                                  u64 value, u64 addr, u32 index, GPUPatchFlags flags) {
-    // std::cout << "ENTER TORCH VIEW UNIT ACCESS: " << memory.memory_range.start << " : " << pc << std::endl;
     // if (true) { 
 # ifdef DEBUG
       std::cout << "pc: " << std::hex << pc << " mem: " << memory.memory_range.start << std::dec << std::endl;
@@ -314,8 +307,41 @@ namespace redshow {
 
     copy_out.close();
 
+
+/**
+  * Log the View forest 
+  * 
+  */
+    // Log the forest
+    if (!forest_tree_out.is_open()){
+      forest_tree_out = std::ofstream(output_dir + "forest.txt", std::ios::app);
+    }
+    // std::ofstream fout(output_dir + "forest.txt", std::ios::app);
+    for (unsigned i = 0; i < _roots.size(); i++) {
+      if (_roots.at(i)->_children.empty() && call_path_map[_roots.at(i)->view_id].at(0).ctxid_pcs.empty()) {
+        auto _dead = call_path_map.find(_roots.at(i)->view_id);
+        if (_dead != call_path_map.end()) {
+          call_path_map.erase(_dead);
+        }
+      } else {
+        _roots.at(i)->delete_children_nodes(forest_tree_out);
+        forest_tree_out << '\n';
+      }
+      delete _roots.at(i);
+      _roots.erase(_roots.begin()+i);
+      --i;
+    }
+    forest_tree_out.close();
+
+/**
+  * Log ViewNode access info
+  * 
+  */
     std::ofstream out(output_dir + "torch_view_report.csv");
 
+    // REMOVE
+    auto t_start = std::chrono::system_clock::now();
+    // END REMOVE
     for(auto iter = call_path_map.begin(); iter != call_path_map.end(); iter++){
       out << "id " << iter->first << std::endl;
       out << "python_state " << std::endl; // Python StateS begin
@@ -373,17 +399,6 @@ namespace redshow {
 
     out.close();
 
-    // Log the forest
-    for (unsigned i = 0; i < _roots.size(); i++) {
-      std::ofstream fout(output_dir + "forest.txt", std::ios::app);
-      for (unsigned i = 0; i < _roots.size(); i++) {
-        _roots.at(i)->delete_children_nodes(fout);
-        fout << '\n';
-        _roots.erase(_roots.begin()+i);
-        --i;
-      }
-      fout.close();
-    }
     // unlock();
   }
 

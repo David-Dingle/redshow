@@ -32,7 +32,7 @@ else
 OFLAGS += -march=native
 endif
 
-CFLAGS := -fPIC -std=c++17 $(OFLAGS)
+CFLAGS := -fPIC -std=c++20 $(OFLAGS)
 LDFLAGS := -fPIC -shared -L$(BOOST_DIR)/lib -lboost_graph -lboost_regex
 
 ifdef OPENMP

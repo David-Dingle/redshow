@@ -247,12 +247,18 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
             std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
             analysis_ptr->_op_stack.push(callback_data->data.op_data);
             analysis_ptr->_domain_name.push(std::string(callback_data->data.op_data.name));  // use together with PythonState
+            // clear previous domain inputs tensor info(input tensors' respective ptr in view forest shadow memory)
+            analysis_ptr->_input_viewnode_forest_ptrs.clear();
             for (int64_t i = 0 ; i < callback_data->data.op_data.input_output_data.size; i++) {
               torch_monitor_callback_tensor_data_t titer = callback_data->data.op_data.input_output_data.tensor_data[i];
-              if (titer.index == -1 || titer.numel <= 0)
+              if (titer.index == -1 || titer.numel <= 0){
+                analysis_ptr->_input_viewnode_forest_ptrs[i] = nullptr;
                 continue;
+              }
               u64 view_id = update_op_id_func();
-              analysis_ptr->update_view_forest(titer, view_id, true);  // update the view forest
+              redshow::TorchView::ViewNode * input_viewnode_forest_ptr = analysis_ptr->update_view_forest(titer, view_id, true);  // update the view forest
+              analysis_ptr->_input_viewnode_forest_ptrs[i] = input_viewnode_forest_ptr;
+              // std::cout << "redshow input: " << input_viewnode_forest_ptr->view_id << std::endl;
             }
           }
         }  // ends stack operation
