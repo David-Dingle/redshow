@@ -17,6 +17,7 @@ struct MemoryRange {
   MemoryRange(u64 start, u64 end) : start(start), end(end) {}
 
   bool operator<(const MemoryRange &other) const { return start < other.start; }
+  bool operator==(const MemoryRange &other) const { return start == other.start && end ==other.end; }
 };
 
 struct Memory : public Operation {

@@ -26,10 +26,13 @@
 #include <iostream>
 #include <algorithm>
 
-#include "/home/xjding/Projects/new_DrGPUM/DrGPUM/torch-monitor/include/torch_monitor.h"
+#include "../../../torch-monitor/include/torch_monitor.h" // header file of torch-monitor plugin.
 
 #include <fstream>
 #include <string.h>
+#include <unordered_map>
+#include <boost/icl/interval_map.hpp>
+#include <chrono>
 
 const static size_t MAX_NUM_STATES = 30;
 thread_local static size_t num_states;
@@ -125,6 +128,7 @@ namespace redshow {
      return res;
    }
 
+   std::map<uint64_t, std::vector<redshow::MemoryRange>> viewnode_mem_range_map = {}; // used by redshow.cpp:redshow_torchview_ongpu_get_range_size; delete corresponding element while view tree deletion
 
    struct ViewNode {
      u64 view_id;
@@ -140,6 +144,7 @@ namespace redshow {
      metadata_ptr_t metadata_ptr;
      mem_range_t mem_block_range;  // <block start, block end>
      bool is_sorted;
+     bool is_memory_write_pc = false;
      std::map<uint64_t, uint64_t> pc_access; // int _total_access = 0;
      std::vector<ViewNode*> _children = {};
 
@@ -158,6 +163,7 @@ namespace redshow {
         }
         this->mem_block_range = mem_range_t{data_ptr, data_ptr+(itemsize * numel)};
         this->is_sorted = true;
+        this->is_memory_write_pc = false;
       }
 
       /**other nodes*/
@@ -172,6 +178,7 @@ namespace redshow {
           this->strides[i] = strides[i];
         }
         this->is_sorted = false;
+        this->is_memory_write_pc = false;
       }
 
 //      ~ViewNode(){
@@ -216,7 +223,7 @@ namespace redshow {
         return this->_children.empty();
       }
 
-      void delete_children_nodes(std::ofstream& out) {
+      void delete_children_nodes(std::ofstream& out, std::map<uint64_t, std::vector<redshow::MemoryRange>>& viewnode_mem_range_map) {
         if (! this->is_leaf_node()) {
           out << this->view_id << ": { " ;
           out << this->data_ptr << " ";
@@ -227,7 +234,8 @@ namespace redshow {
           }
           out << "\n";
           for (auto child : this->_children) {
-            child->delete_children_nodes(out);
+            viewnode_mem_range_map.erase(child->view_id); // used by ongpu analysis
+            child->delete_children_nodes(out, viewnode_mem_range_map);
             delete child;
           }
           out << "  }" << this->view_id << '\n';
@@ -292,10 +300,19 @@ namespace redshow {
      bool operator() (ViewNode* l_ptr,ViewNode* r_ptr) { return (l_ptr->data_ptr < r_ptr->data_ptr);}
    } ViewNode_ptr_comp;
 
+   bool torch_view_ongpu = false;
+   gpu_patch_aux_torchview_dict_t* torchview_dict = NULL;
+
    std::vector<ViewNode*> _roots = {};  // The node forest //TODO: optimize
    std::map<u64, std::vector<PyStateCTX>> call_path_map = {};
    std::vector<mem_range_t> gpu_mem_blocks = {};
    std::map<int64_t, ViewNode*> _input_viewnode_forest_ptrs = {};
+   std::map<u64, std::vector<std::pair<uint64_t, uint64_t>>> write_after_write_map = {}; // view_node : vector of pair<python_state_hashes, pc>
+
+   // torchview ongpu analysis, work with torchview::torch_view_ongpu_view_node_range_dict_t, and gpu-patch.h/gpu_patch_aux_address_dict_t
+   // call redshow_torchview_ongpu_set_range_size(torchview_memory_snapshot.size()) to update "number of ranges" every after torchview::update_view_forest
+   // empty every after PyTorch domain exit
+   redshow::LockableMap<redshow::MemoryRange, ViewNode*> torchview_memory_snapshot {};
 
    /** find view root from the forest */
    std::vector<ViewNode*> find_root_node(ViewNode r_node) {
@@ -328,6 +345,73 @@ namespace redshow {
      return ret;
    }
 
+
+  /**
+    * Precursor of MemoryMap for on gpu analysis
+    * start_end: the unit component of gpu_patch_aux_torchview_dict_t
+    */
+   typedef struct torch_view_ongpu_view_node_range_dict {
+     gpu_patch_analysis_address_t start_end;
+     ViewNode* viewnode_ptr;
+   } torch_view_ongpu_view_node_range_dict_t;
+
+
+   struct torch_view_ongpu_view_node_range_dict_comp {
+     bool operator() (torch_view_ongpu_view_node_range_dict_t& l_dict, torch_view_ongpu_view_node_range_dict_t& r_dict) { return (l_dict.start_end.start < r_dict.start_end.start);}
+   } torch_view_ongpu_view_node_range_dict_comp;
+
+
+  /**
+    * 
+    */
+   std::vector<data_ptr_t> get_high_dim_i_th_range_start_ptr(std::vector<data_ptr_t> dim_start_ptrs, int64_t stride, int64_t size, u64 itemsize) {
+     std::vector<data_ptr_t> res;
+     for (auto start_ptr : dim_start_ptrs) {
+       for(size_t i = 0; i < size; i++) {
+         res.push_back(start_ptr + i * itemsize * stride);
+         break;
+       }
+     }
+     return res;
+   }
+
+   
+  /**
+    * A helper function works with torchview-ongpu mode "torch_view_ongpu == True"
+    * Store view nodes' MemoryRange on each dimension in torchview_memory_snapshot
+    */
+   void updata_torchview_memory_snapshot(ViewNode* input_node) {
+     if (!input_node || input_node->dim == 0) {
+       return;
+     }
+     sort_tensor_strides(input_node);
+     assert(torch_view_ongpu);
+     assert(input_node->is_sorted);
+     
+     auto view_range_iter = viewnode_mem_range_map.find(input_node->view_id);
+     std::cout << "input_node: " << input_node << " view_id: " << input_node->view_id << " dim: " << input_node->dim << std::endl;
+     if (view_range_iter == viewnode_mem_range_map.end()) {
+      viewnode_mem_range_map[input_node->view_id] = std::vector<redshow::MemoryRange>{};
+      uint64_t last_ele = input_node->data_ptr;
+      for(size_t i = 0; i < input_node->dim; i++) {
+        size_t offset_i;
+        if ((input_node->sizes[i] - 1) > 0){
+          offset_i = (input_node->sizes[i] - 1);
+         }else {
+          offset_i = 0;
+        }
+      }
+      viewnode_mem_range_map[input_node->view_id].emplace_back(input_node->data_ptr, last_ele + input_node->itemsize);
+      torchview_memory_snapshot[redshow::MemoryRange(input_node->data_ptr, last_ele + input_node->itemsize)] = input_node;
+     
+     } else if (view_range_iter != viewnode_mem_range_map.end()) {
+      for (auto mem_range : view_range_iter->second) {
+        torchview_memory_snapshot[mem_range] = input_node;
+      }
+     }
+   }
+   
+
   /**
    * add a node to the forest iif captured a new tensor/view
    * increase the corresponding _total_access by 1 if the tensor/view exists
@@ -354,7 +438,7 @@ namespace redshow {
            break;
          }
        }
-       if (view_existed && is_domain_enter) {
+       if (view_existed) {
          // Update Python State
          PyStateCTX _state{tensor_data.index, num_states, python_states};
          if (!_domain_name.empty()) {
@@ -457,20 +541,24 @@ namespace redshow {
     * @param mem_start_addr: starting address of memory range
     */
    std::ofstream forest_tree_out;
-   void delete_forest_tree(const std::string &output_dir, data_ptr_t mem_start_addr, int64_t total_allocated) {
+   void delete_forest_tree(const std::string &output_dir, data_ptr_t mem_start_addr, uint64_t total_allocated) {
      lock();
      if (!forest_tree_out.is_open()){
        forest_tree_out = std::ofstream(output_dir + "forest.txt", std::ios::app);
      }
      // std::ofstream out(output_dir + "forest.txt", std::ios::app);
-     ViewNode* fake_node = _roots[0];
-     ViewNode* _low = new ViewNode(fake_node->view_id, 0, 0, 0, fake_node->dtype, 0,
-                                    0, fake_node->sizes, fake_node->strides, (mem_start_addr),
-                                    fake_node->metadata_ptr);
+    // ViewNode* fake_node = _roots[0];
+    //  ViewNode* _low = new ViewNode(fake_node->view_id, 0, 0, 0, fake_node->dtype, 0,
+    //                                 0, fake_node->sizes, fake_node->strides, (mem_start_addr),
+    //                                 fake_node->metadata_ptr);
+     ViewNode* _low = new ViewNode(0, 0, 0, 0, TORCH_MONITOR_SCALAR_TYPES_UNMATCHED_TYPE, 0,
+                                    0, {}, {}, (mem_start_addr),
+                                    0);
 
      auto it_low = std::lower_bound(_roots.begin(), _roots.end(), _low, ViewNode_ptr_comp);
+     delete _low;
      for (unsigned i = it_low - _roots.begin(); i < _roots.size(); i++) {
-       std::cout << "delete index: " << i << std::endl; 
+       // std::cout << "delete index: " << i << std::endl; 
        if (_roots.at(i)->mem_block_range.second > (mem_start_addr + total_allocated)) {
          break;
        }
@@ -478,13 +566,14 @@ namespace redshow {
          /** 
           * if the tree has no children, and the root has no ctx-pc access 
           * */
-         if (_roots.at(i)->_children.empty() && call_path_map[_roots.at(i)->view_id].at(0).ctxid_pcs.empty()) {
+         if (_roots.at(i)->_children.empty() && call_path_map[_roots.at(i)->view_id].size() <= 1 && call_path_map[_roots.at(i)->view_id].at(0).ctxid_pcs.empty()) {
            auto _dead = call_path_map.find(_roots.at(i)->view_id);
            if (_dead != call_path_map.end()) {
              call_path_map.erase(_dead);
            }
          } else {
-           _roots.at(i)->delete_children_nodes(forest_tree_out);
+           viewnode_mem_range_map.erase(_roots.at(i)->view_id); // erase anyway. used by ongpu analysis
+           _roots.at(i)->delete_children_nodes(forest_tree_out, viewnode_mem_range_map);
            forest_tree_out << '\n';
          }
          delete _roots.at(i);
@@ -503,21 +592,28 @@ namespace redshow {
     */
    void update_node_total_access(std::vector<ViewNode*> view_nodes, uint64_t pc) {
      // lock(); // TODO: Try fix later: another lock; Or try to make it sequential
+    //  for (auto viter : view_nodes) {
+    //    std::vector<ViewNode*> _root_node = find_root_node(*viter);
+    //    if (_root_node.empty()) {
+    //      continue;
+    //    }
+    //    ViewNode *_node;
+    //    for (auto riter = _root_node.begin(); riter != _root_node.end(); riter++) {
+    //      _node = (*riter)->find_node(*viter);
+    //      if (_node)
+    //        break;
+    //    }
+    //    if(_node->pc_access.find(pc) != _node->pc_access.end()) {
+    //      _node->pc_access[pc]++;
+    //    } else {
+    //     _node->pc_access[pc] = 1;
+    //    }
+    //  }
      for (auto viter : view_nodes) {
-       std::vector<ViewNode*> _root_node = find_root_node(*viter);
-       if (_root_node.empty()) {
-         continue;
-       }
-       ViewNode *_node;
-       for (auto riter = _root_node.begin(); riter != _root_node.end(); riter++) {
-         _node = (*riter)->find_node(*viter);
-         if (_node)
-           break;
-       }
-       if(_node->pc_access.find(pc) != _node->pc_access.end()) {
-         _node->pc_access[pc]++;
+       if(viter->pc_access.find(pc) != viter->pc_access.end()) {
+         viter->pc_access[pc]++;
        } else {
-        _node->pc_access[pc] = 1;
+        viter->pc_access[pc] = 1;
        }
      }
      // unlock();
@@ -536,7 +632,7 @@ namespace redshow {
      for(int64_t i = 0; i < dim - 1; i++) {
        swapped = false;
        int64_t temp;
-       for(int64_t j = 0; j < dim - i - i; j++) {
+       for(int64_t j = 0; j < dim - i - 1; j++) {
          if(res.strides[j] < res.strides[j + 1]){
            temp = res.strides[j];
            res.strides[j] = res.strides[j + 1];
@@ -727,7 +823,7 @@ namespace redshow {
      for(int64_t i = 0; i < dim - 1; i++) {
        swapped = false;
        int64_t temp;
-       for(int64_t j = 0; j < dim - i - i; j++) {
+       for(int64_t j = 0; j < dim - i - 1; j++) {
          if(tensor->strides[j] < tensor->strides[j + 1]){
            temp = tensor->strides[j];
            tensor->strides[j] = tensor->strides[j + 1];
@@ -770,7 +866,7 @@ namespace redshow {
 
 
 /**
- * 
+ * Serves pure CPU traceing
  * 
  *  NEW ONE
 */
@@ -785,12 +881,11 @@ namespace redshow {
        }
      } else{ // if delayed, we will match mem unit access to all roots
        if (!_roots.empty()){
-         ViewNode* fake_node = _roots[0];
-         ViewNode* _low = new ViewNode(fake_node->view_id, 0, 0, 0, fake_node->dtype, 0,
-                                       0, fake_node->sizes, fake_node->strides, (mem_addr_hit),
-                                       fake_node->metadata_ptr);
+         ViewNode* _low = new ViewNode(0, 0, 0, 0, TORCH_MONITOR_SCALAR_TYPES_UNMATCHED_TYPE, 0,
+                                       0, {}, {}, (mem_addr_hit),
+                                       0);
          auto it_low = std::lower_bound(_roots.begin(), _roots.end(), _low, ViewNode_ptr_comp);
-
+         delete _low;
          for(uint64_t i = it_low - _roots.begin(); i < _roots.size(); i++){
            if (mem_addr_hit > _roots.at(i)->mem_block_range.second) {
              break;
@@ -799,7 +894,6 @@ namespace redshow {
              possible.push_back(_roots.at(i));
            }
          }
-
        }
      } // end delayed possible search
      // sort possible tensor strides
@@ -837,6 +931,7 @@ namespace redshow {
      // don't care about read or write in this mode, just need to know access or not
      // PyStateCTX python_state;
      Map<u64, Map<u64, u64>> access_memory; // Map<pc, Map<mem_start, ctx_id>>
+     std::set<uint64_t> write_pcs = {};
 
      TorchViewTrace() = default;
 
@@ -849,7 +944,8 @@ namespace redshow {
       // u64: Memory:Operation->op_id
       // don't care about read or write in this mode, just need to know access or not
       PyStateCTX python_state;
-      Map<u64, Map<u64, u64>> access_memory; // map with sort but vector not
+      Map<u64, Map<u64, u64>> access_memory; // Map<pc, Map<mem_start, delayed_ctx_id>>
+      std::set<uint64_t> write_pcs = {};
 
       TorchViewDelayedTrace() = default;
 
@@ -923,6 +1019,11 @@ namespace redshow {
             _delayed_trace->python_state.object_type = VIEW_NODE;
             call_path_map[(*viter)->view_id].push_back(_delayed_trace->python_state);
             call_path_map[(*viter)->view_id].back().ctxid_pcs[c].push_back(pc);
+            if(_delayed_trace->write_pcs.find(pc) != _delayed_trace->write_pcs.end()) {
+              (*viter)->is_memory_write_pc = true;
+            } else {
+              (*viter)->is_memory_write_pc = false;
+            }
           }
           // std::cout << "Delayed Kernel Access Hits: " << view_node_hit_mem.size() << " View Node(s). :: " << mem_start << std::endl;
           if(view_node_hit_mem.empty()){

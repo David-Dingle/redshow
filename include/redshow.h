@@ -198,6 +198,28 @@ EXTERNC redshow_result_t redshow_analysis_enable(redshow_analysis_type_t analysi
 EXTERNC redshow_result_t redshow_analysis_enabled(redshow_analysis_type_t analysis_type);
 
 /**
+ * @brief This function is used to get torch-view-ongpu gpu_patch_aux_torchview_dict_t.view_range_size
+ * 
+ * @param empty
+ * @return number of memory ranges on CUDA global memory
+*/
+EXTERNC unsigned long redshow_torchview_ongpu_get_range_size();
+
+/**
+ * @brief This function is used to set torch-view-ongpu gpu_patch_aux_torchview_dict_t.view_range_size
+ * 
+ * @param empty
+ * @return empty
+ * 
+ * @thread-safe: No
+*/
+EXTERNC void redshow_torchview_ongpu_set_ongpu();
+
+EXTERNC int redshow_torchview_ongpu_get_ongpu();
+
+EXTERNC void redshow_torchview_assemble_patch_analysis_address(gpu_patch_analysis_address_t* viewnode_ranges_host);
+
+/**
  * @brief This function is used to cancel specific analysis types.
  *
  * @param analysis_type

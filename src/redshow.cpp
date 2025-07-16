@@ -87,6 +87,56 @@ static redshow_data_type_t default_data_type = REDSHOW_DATA_UNKNOWN;
 
 static std::mutex mtx;  // the lock for torch_view functional callback
 
+unsigned long redshow_torchview_ongpu_get_range_size() {
+  for (auto iter : analysis_enabled){
+    if (iter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
+      std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
+      if (analysis_ptr->torchview_memory_snapshot.empty() && !analysis_ptr->_input_viewnode_forest_ptrs.empty()) {
+        for (auto [idx, ptr] : analysis_ptr->_input_viewnode_forest_ptrs) {
+          analysis_ptr->updata_torchview_memory_snapshot(ptr);
+        }
+      }
+      return analysis_ptr->torchview_memory_snapshot.size();
+    }
+  }
+  return 0;
+}
+
+void redshow_torchview_ongpu_set_ongpu() {
+  for (auto iter : analysis_enabled){
+    if (iter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
+      std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
+      analysis_ptr->torch_view_ongpu = true;
+    }
+  }
+}
+
+int redshow_torchview_ongpu_get_ongpu() {
+  for (auto iter : analysis_enabled){
+    if (iter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
+      std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
+      return (analysis_ptr->torch_view_ongpu)? 1 : 0;
+    }
+  }
+  return 0;
+}
+
+
+void redshow_torchview_assemble_patch_analysis_address(gpu_patch_analysis_address_t* viewnode_ranges_host) {
+  for (auto iter : analysis_enabled){
+    if (iter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
+      std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
+      // size_t range_size = analysis_ptr->torchview_memory_snapshot.size();
+      for (auto iter = analysis_ptr->torchview_memory_snapshot.begin(); iter != analysis_ptr->torchview_memory_snapshot.end(); iter++) {
+        size_t offset = std::distance(analysis_ptr->torchview_memory_snapshot.begin(), iter);
+        (viewnode_ranges_host + offset)->start = iter->first.start;
+        (viewnode_ranges_host + offset)->end = iter->first.end;
+      }
+    }
+  }
+}
+
+
 static void torch_memory_callback(torch_monitor_callback_site_t callback_site,
                                   torch_monitor_callback_data_t* callback_data) {
   if (callback_site == TORCH_MONITOR_CALLBACK_ENTER) {
@@ -249,6 +299,7 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
             analysis_ptr->_domain_name.push(std::string(callback_data->data.op_data.name));  // use together with PythonState
             // clear previous domain inputs tensor info(input tensors' respective ptr in view forest shadow memory)
             analysis_ptr->_input_viewnode_forest_ptrs.clear();
+            analysis_ptr->torchview_memory_snapshot.clear();
             for (int64_t i = 0 ; i < callback_data->data.op_data.input_output_data.size; i++) {
               torch_monitor_callback_tensor_data_t titer = callback_data->data.op_data.input_output_data.tensor_data[i];
               if (titer.index == -1 || titer.numel <= 0){
@@ -368,8 +419,9 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
               if (titer.index == -1 || titer.numel <= 0)
                 continue;
               u64 view_id = update_op_id_func();
-              analysis_ptr->update_view_forest(titer, view_id, true);  // update the view forest
+              analysis_ptr->update_view_forest(titer, view_id, false);  // update the view forest but no need to update torchiew-ongpu(if enabled) torchview_memory_snapshot
             }
+            analysis_ptr->torchview_memory_snapshot.clear();
             analysis_ptr->_op_stack.pop();
             analysis_ptr->_domain_name.pop();
           }
