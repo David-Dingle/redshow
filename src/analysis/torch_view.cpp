@@ -56,7 +56,12 @@ namespace redshow {
  * Need fix
  * */
   void TorchView::kernel_op_callback(std::shared_ptr<Kernel> op) {
-    torch_monitor_python_state_get(MAX_NUM_STATES, delayed_python_states, &num__delayed_states);
+    // pythonState_lock.lock();
+    torch_monitor_status_t state = torch_monitor_python_state_get(MAX_NUM_STATES, delayed_python_states, &num__delayed_states);
+    if (state != TORCH_MONITOR_STATUS_SUCCESS) {
+      std::cout << "Get 0 resultes cpp" << std::endl;
+    }
+    // pythonState_lock.unlock();
     std::string all_states("");
     if (num__delayed_states > 0 && num__delayed_states <= MAX_NUM_STATES) {
       for(size_t i = 0; i < num__delayed_states; i++) {
@@ -84,6 +89,7 @@ namespace redshow {
       if (!_delayed_trace) {
         _delayed_trace = std::make_shared<TorchViewDelayedTrace>();
         // torch_monitor_python_state_get(MAX_NUM_STATES, delayed_python_states, &num__delayed_states);
+        std::cout << "Checkpoint 6" << std::endl;
         PyStateCTX _state{-1, num__delayed_states, delayed_python_states};
         if (num__delayed_states > 0) {
           if (!_domain_name.empty()) {
@@ -99,19 +105,34 @@ namespace redshow {
   # ifdef DEBUG
       std::cout << "We Got " <<  _trace->access_memory.size() << " memory accesses." << std::endl;
   # endif
+      std::set<ViewNode*> hit_set;
       for (auto & [pc, m_c] : _trace->access_memory) {
+        hit_set.clear();
         for (auto & [m, c] : m_c) {  // m is real mem_start addr, c is 0 place holder. Use op->ctx_id instead
           u64 mem_start = m;
           std::vector<ViewNode*> view_node_hit_mem;
 
-          if(_pc_node_cache.find(pc) != _pc_node_cache.end()) {
-            update_node_total_access(_pc_node_cache[pc], pc);
-            continue; // just update access counter, but dont add callpath again and again
-          } else {
-            view_node_hit_mem = new_get_view_nodes_by_mem_addr(mem_start, false);
-            update_node_total_access(view_node_hit_mem, pc);
-            _pc_node_cache[pc] = view_node_hit_mem;
-          }
+          // if(_pc_node_cache.find(pc) != _pc_node_cache.end()) {
+          //   update_node_total_access(_pc_node_cache[pc], pc);
+          //   continue; // just update access counter, but dont add callpath again and again
+          // } else {
+          //   view_node_hit_mem = new_get_view_nodes_by_mem_addr(mem_start, false);
+          //   update_node_total_access(view_node_hit_mem, pc);
+          //   _pc_node_cache[pc] = view_node_hit_mem;
+          // }
+
+  
+          // view_node_hit_mem = new_get_view_nodes_by_mem_addr(mem_start, false);
+          // if( !view_node_hit_mem.empty() && 
+          //     hit_set.find(view_node_hit_mem.front()) == hit_set.end()) {
+          //   hit_set.insert(view_node_hit_mem.front());
+          //   update_node_total_access(view_node_hit_mem, pc);
+          // } else {
+          //   continue;
+          // }
+
+          view_node_hit_mem = new_get_view_nodes_by_mem_addr(mem_start, false);
+          update_node_total_access(view_node_hit_mem, pc);
 
           // Update Call ctc_id to CallPath
           for (auto viter = view_node_hit_mem.begin(); viter != view_node_hit_mem.end(); viter++){
@@ -160,9 +181,11 @@ namespace redshow {
   # ifdef DEBUG
           std::cout << "Kernel Access Hits: " << view_node_hit_mem.size() << " View Node(s). :: " << mem_start << std::endl;
   # endif
+          // if (hit_set.empty()) {
           if (view_node_hit_mem.empty()){
             // if (!_delayed_trace->access_memory.has(pc)) {
             if (true) {
+              std::cout << "Store delayed access: " << pc << " Mem Start: " << mem_start << std::endl;
               _delayed_trace->access_memory[pc].emplace(mem_start, op->ctx_id);
               if(_trace->write_pcs.find(pc) != _trace->write_pcs.end()) {
                 _delayed_trace->write_pcs.insert(pc);
@@ -350,9 +373,9 @@ namespace redshow {
       u64 dst_shadow_start = op->dst_shadow_start;
 
       // (mem_range_t)mem_range{mem_addrs, mem_addrs + op->len};
-      std::vector<ViewNode*> view_node_hit_src = {};// get_view_nodes_by_mem_addr(src_start);
-      std::vector<ViewNode*> view_node_hit_dst = {};// get_view_nodes_by_mem_addr(dst_start);
-      std::vector<ViewNode*> view_node_hit_shadow = {};//get_view_nodes_by_mem_addr(dst_shadow_start);
+      std::vector<ViewNode*> view_node_hit_src = {}; //new_get_view_nodes_by_mem_addr(src_start, false);
+      std::vector<ViewNode*> view_node_hit_dst = {} ;//new_get_view_nodes_by_mem_addr(dst_start, false);
+      std::vector<ViewNode*> view_node_hit_shadow = {} ;// new_get_view_nodes_by_mem_addr(dst_shadow_start, false);
 
 # ifdef DEBUG
       std::cout << "memcpy hit: " << view_node_hit_src.size() << " " <<
@@ -462,7 +485,7 @@ namespace redshow {
                                  u64 value, u64 addr, u32 index, GPUPatchFlags flags) {
     // if (true) { 
 # ifdef DEBUG
-      std::cout << "pc: " << std::hex << pc << " mem: " << memory.memory_range.start << std::dec << std::endl;
+      // std::cout << "pc: " << std::hex << pc << " mem: " << memory.memory_range.start << std::dec << std::endl;
 # endif
     if (!_trace->access_memory.has(pc)) {
       _trace->access_memory[pc].emplace(memory.memory_range.start, 0); // 0 placeholder;
@@ -490,11 +513,11 @@ namespace redshow {
     // lock();
     // Log device_view_copy_map
     std::ofstream copy_out(output_dir + "aten_copy_map.txt");
-    copy_out << "Target   :   Source" << std::endl;
+    // copy_out << "Target   :   Source" << std::endl;
     for(auto& [_hash, t_s] : device_view_copy_map) {
       copy_out << _hash << std::endl;
       for(auto& [tar, src] : t_s) {
-        copy_out << "        " << tar << " : " << src << std::endl;
+        copy_out << "    " << src << " -> " << tar << "; " << std::endl;
       }
     }
 
@@ -518,22 +541,41 @@ namespace redshow {
       forest_tree_out = std::ofstream(output_dir + "forest.txt", std::ios::app);
     }
     // std::ofstream fout(output_dir + "forest.txt", std::ios::app);
-    for (unsigned i = 0; i < _roots.size(); i++) {
-      if (_roots.at(i)->_children.empty() && call_path_map[_roots.at(i)->view_id].at(0).ctxid_pcs.empty()) {
-        auto _dead = call_path_map.find(_roots.at(i)->view_id);
-        if (_dead != call_path_map.end()) {
-          call_path_map.erase(_dead);
-        }
-      } else {
-        _roots.at(i)->delete_children_nodes(forest_tree_out, viewnode_mem_range_map);
-        forest_tree_out << '\n';
-      }
-      delete _roots.at(i);
-      _roots.erase(_roots.begin()+i);
-      --i;
-    }
-    // delete_forest_tree(output_dir, 0, ((uint64_t)0) - 1);
+
+    // std::cout << "Remain roots: " << _roots.size() << std::endl;
+    // for (auto root : _roots) {
+    //   std::cout << "Root view id: " << root->view_id << std::endl;
+    //   std::cout << "Mem range" << root->data_ptr << " - " << root->data_ptr + root->itemsize * root->numel << std::endl;
+    //   std::cout << call_path_map[root->view_id].begin()->py_state[0].lineno<< " " << call_path_map[root->view_id].begin()->py_state[0].function_name << std::endl; 
+    //   if(call_path_map[root->view_id].begin()->ctxid_pcs.size() > 0) {
+    //     std::cout << "Root has ctx_id size: " << call_path_map[root->view_id].begin()->ctxid_pcs.begin()->second.at(0) << std::endl;
+    //   }
+    // }
+
+
+    // for (unsigned i = 0; i < _roots.size(); i++) {
+    //   if (_roots.at(i)->_children.empty() && call_path_map[_roots.at(i)->view_id].at(0).ctxid_pcs.empty()) {
+    //     auto _dead = call_path_map.find(_roots.at(i)->view_id);
+    //     if (_dead != call_path_map.end()) {
+    //       call_path_map.erase(_dead);
+    //     }
+    //   } else {
+    //     _roots.at(i)->delete_children_nodes(forest_tree_out, viewnode_mem_range_map);
+    //     forest_tree_out << '\n';
+    //   }
+    //   delete _roots.at(i);
+    //   _roots.erase(_roots.begin()+i);
+    //   --i;
+    // }
+    delete_forest_tree(output_dir, 0, std::numeric_limits<uint64_t>::max());
     forest_tree_out.close();
+
+    
+    /**
+     * Print all cross tree relations
+    */
+    dump_cross_tree_relation_at_system_flush(output_dir);
+
 
 /**
   * Log ViewNode access info

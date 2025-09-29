@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-#include "analysis/torch_view.h"  // new model
+// #include "analysis/torch_view.h"  // new model
 #include "analysis/torch_monitor.h"
 #include "analysis/data_dependency.h"
 #include "analysis/memory_liveness.h"
@@ -22,6 +22,7 @@
 #include "analysis/spatial_redundancy.h"
 #include "analysis/temporal_redundancy.h"
 #include "analysis/value_pattern.h"
+#include "analysis/torch_view.h"  // new model
 #include "binutils/cubin.h"
 #include "binutils/instruction.h"
 #include "binutils/real_pc.h"
@@ -35,8 +36,10 @@
 #include "operation/memory.h"
 #include "operation/memset.h"
 #include "operation/memfree.h"
-
 #include "torch_monitor.h"
+
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
 #ifdef DEBUG
 #define PRINT(...) fprintf(stderr, __VA_ARGS__)
@@ -86,6 +89,102 @@ static int decimal_degree_f64 = VALID_DOUBLE_DIGITS;
 static redshow_data_type_t default_data_type = REDSHOW_DATA_UNKNOWN;
 
 static std::mutex mtx;  // the lock for torch_view functional callback
+
+namespace py = pybind11;
+static void launch_metadata_report(std::vector<std::tuple<int64_t ,
+                                                                int64_t ,
+                                                                int64_t ,
+                                                                uint64_t ,
+                                                                int64_t ,
+                                                                std::vector<int64_t> ,
+                                                                std::vector<int64_t> ,
+                                                                uint64_t ,
+                                                                uint64_t >
+                                                    > metadata_list) {
+  std::vector<torch_monitor_callback_tensor_data_t> tensors = {};
+  for(auto idx = metadata_list.begin(); idx != metadata_list.end(); ++idx) {
+    torch_monitor_callback_tensor_data_t tensor = torch_monitor_callback_tensor_data_t();
+    tensor.index = std::get<0>(*idx);
+    tensor.numel = std::get<1>(*idx);
+    tensor.dim = std::get<2>(*idx);
+    tensor.dtype = TORCH_MONITOR_SCALAR_TYPES_UNMATCHED_TYPE;
+    tensor.itemsize = std::get<3>(*idx);
+    tensor.storage_offset = std::get<4>(*idx);
+    for (int64_t i = 0; i < std::min<int64_t>(TORCH_MONITOR_MAX_TENSOR_DIMENSION, tensor.dim); i++) {
+      tensor.sizes[i] = std::get<5>(*idx)[i];
+      tensor.strides[i] = std::get<6>(*idx)[i];
+    }
+    tensor.data_ptr = reinterpret_cast<void*>(std::get<7>(*idx));
+    tensor.metadata_ptr = reinterpret_cast<void*>(std::get<8>(*idx));
+    tensors.push_back(tensor);
+  }
+
+  pythonState_lock.lock();
+  torch_monitor_status_t state = torch_monitor_python_state_get(MAX_NUM_STATES, python_states, &num_states);
+  if (state != TORCH_MONITOR_STATUS_SUCCESS) {
+    std::cout << "Get 0 resultes redshow" << std::endl;
+  }
+  pythonState_lock.unlock();
+
+  std::cout << "Triton Python states length: " << num_states << std::endl;
+  // for(size_t i = 0; i < num_states; i++) {
+  //   std::cout << "  File name: " << python_states[i].file_name << std::endl;
+  //   std::cout << "  Function name: " << python_states[i].function_name << std::endl;
+  //   std::cout << "  Function first line no: " << python_states[i].function_first_lineno << std::endl;
+  //   std::cout << "  Line no: " << python_states[i].lineno << std::endl;
+  // }
+
+  for (auto iter : analysis_enabled){
+    if (iter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
+      std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
+      analysis_ptr->_input_viewnode_forest_ptrs.clear();
+      analysis_ptr->torchview_memory_snapshot.clear();
+      for (int64_t i = 0 ; i < tensors.size(); i++) {
+        torch_monitor_callback_tensor_data_t titer = tensors[i];
+        if (titer.numel <= 0){
+          analysis_ptr->_input_viewnode_forest_ptrs[i] = nullptr;
+          continue;
+        }
+        redshow::TorchView::ViewNode * input_viewnode_forest_ptr = analysis_ptr->find_triton_view_node(titer);  // update the view forest
+        if (input_viewnode_forest_ptr) {
+          analysis_ptr->_input_viewnode_forest_ptrs[i] = input_viewnode_forest_ptr;
+        } 
+      }
+    }
+  }  // ends stack operation
+
+  // for (auto tensor : tensors) {
+  //   std::cout << "  Index: " << tensor.index + 1 << std::endl;
+  //   std::cout << "    Tensor elements: " << (std::int64_t)tensor.numel << std::endl;
+  //   std::cout << "    Tensor dim: " << (std::int64_t)tensor.dim << std::endl;
+  //   std::cout << "    Tensor dtype: " << torch_monitor_dtype_name_get(tensor.dtype)
+  //             << std::endl;
+  //   std::cout << "    Tensor item size: " << (std::uint64_t)tensor.itemsize
+  //             << std::endl;
+  //   std::cout << "    Tensor storage offset: " << (std::int64_t)tensor.storage_offset
+  //             << std::endl;
+  //   std::cout << "    Tensor sizes: ";
+  //   for (int64_t j = 0;
+  //        j < std::min<int64_t>(TORCH_MONITOR_MAX_TENSOR_DIMENSION, tensor.dim); j++) {
+  //     std::cout << tensor.sizes[j] << ", ";
+  //   }
+  //   std::cout << std::endl;
+  //   std::cout << "    Tensor strides: ";
+  //   for (int64_t j = 0;
+  //        j < std::min<int64_t>(TORCH_MONITOR_MAX_TENSOR_DIMENSION, tensor.dim); j++) {
+  //     std::cout << tensor.strides[j] << ", ";
+  //   }
+  //   std::cout << std::endl;
+  //   std::cout << "    Tensor block address: " << std::hex << tensor.data_ptr << std::dec
+  //             << std::endl;
+  //   std::cout << "    Intrusive Ptr: " << std::hex << tensor.metadata_ptr << std::dec
+  //             << std::endl;
+  // }
+}
+
+PYBIND11_MODULE(libredshow, m) {
+    m.def("launch_metadata_report", &launch_metadata_report, "print the argument list");
+}
 
 unsigned long redshow_torchview_ongpu_get_range_size() {
   for (auto iter : analysis_enabled){
@@ -231,7 +330,9 @@ static void python_state_report() {
 #ifdef DEBUG
   size_t num_states = 0;
   // Allow empty states
+  pythonState_lock.lock();
   torch_monitor_python_state_get(MAX_NUM_STATES, python_states, &num_states);
+  pythonState_lock.unlock();
   for (size_t i = 0; i < num_states; ++i) {
     std::cout << "(" << i << ") "
               << "File: " << std::string(python_states[i].file_name) << std::endl;
@@ -283,7 +384,14 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
         //     delayed_python_states[i].lineno = python_states[i].lineno;
         //   } // ready for delayed pystate insertion
         // }
-        torch_monitor_python_state_get(MAX_NUM_STATES, python_states, &num_states);
+        //pythonState_lock.lock();
+        // torch_monitor_python_state_get(MAX_NUM_STATES, python_states, &num_states);
+
+        torch_monitor_status_t state = torch_monitor_python_state_get(MAX_NUM_STATES, python_states, &num_states);
+        if (state != TORCH_MONITOR_STATUS_SUCCESS) {
+          std::cout << "Get 0 resultes redshow" << std::endl;
+        }
+        //pythonState_lock.unlock();
         // if (num_states > 0) {
         //   torch_monitor_python_state_get(MAX_NUM_STATES, delayed_python_states, &num__delayed_states);
         // }

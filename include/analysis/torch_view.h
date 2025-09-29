@@ -11,6 +11,7 @@
 #include <string>
 #include <optional>
 #include <stack>
+#include <set>
 
 #include "analysis.h"
 #include "binutils/cubin.h"
@@ -39,6 +40,7 @@ thread_local static size_t num_states;
 thread_local static size_t num__delayed_states;
 thread_local static torch_monitor_python_state_t python_states[MAX_NUM_STATES];
 thread_local static torch_monitor_python_state_t delayed_python_states[MAX_NUM_STATES];
+static std::mutex pythonState_lock = {};
 
 namespace redshow {
 
@@ -223,14 +225,49 @@ namespace redshow {
         return this->_children.empty();
       }
 
+      /**
+       * Original
+       * Recursively delete children nodes and log the tree structure
+       * Do not delete, in case you want old-version output.
+      */
+      // void delete_children_nodes(std::ofstream& out, std::map<uint64_t, std::vector<redshow::MemoryRange>>& viewnode_mem_range_map) {
+      //   if (! this->is_leaf_node()) {
+      //     out << this->view_id << ": { " ;
+      //     out << this->data_ptr << " ";
+      //     if (this->pc_access.size() > 0){
+      //       for(auto& [pc, access] : this->pc_access) {
+      //         out << " " << std::hex << pc << std::dec << ":" << access;
+      //       }
+      //     }
+      //     out << "\n";
+      //     for (auto child : this->_children) {
+      //       viewnode_mem_range_map.erase(child->view_id); // used by ongpu analysis
+      //       child->delete_children_nodes(out, viewnode_mem_range_map);
+      //       delete child;
+      //     }
+      //     out << "  }" << this->view_id << '\n';
+      //     this->_children.clear();
+      //   } else{
+      //     out << this->view_id << ": {";
+      //     out << this->data_ptr << " ";
+      //     if (this->pc_access.size() > 0){
+      //       for(auto& [pc, access] : this->pc_access) {
+      //         out << " " << std::hex << pc << std::dec << ":" << access;
+      //       }
+      //     }
+      //     out << " }\n";
+      //   }
+      // }
+
+      /**
+       * New version
+       * Recursively delete children nodes and log the tree structure
+       * Clean layout with tree nodes only.
+       */
       void delete_children_nodes(std::ofstream& out, std::map<uint64_t, std::vector<redshow::MemoryRange>>& viewnode_mem_range_map) {
         if (! this->is_leaf_node()) {
           out << this->view_id << ": { " ;
-          out << this->data_ptr << " ";
           if (this->pc_access.size() > 0){
-            for(auto& [pc, access] : this->pc_access) {
-              out << " " << std::hex << pc << std::dec << ":" << access;
-            }
           }
           out << "\n";
           for (auto child : this->_children) {
@@ -242,13 +279,7 @@ namespace redshow {
           this->_children.clear();
         } else{
           out << this->view_id << ": {";
-          out << this->data_ptr << " ";
-          if (this->pc_access.size() > 0){
-            for(auto& [pc, access] : this->pc_access) {
-              out << " " << std::hex << pc << std::dec << ":" << access;
-            }
-          }
-          out << " }\n";
+          out << " }" << this->view_id << '\n';
         }
       }
    };
@@ -263,6 +294,7 @@ namespace redshow {
    uint64_t aten_copy_pystate_hash = 0;
    uint64_t aten_copy_tar = 0;
    uint64_t aten_copy_src = 0;
+   std::map<u64, std::set<u64>> cross_tree_target_scources = {};
 
   typedef struct python_state {
     char file_name[512];
@@ -282,13 +314,20 @@ namespace redshow {
      PyStateCTX(int64_t index, size_t num_states, torch_monitor_python_state_t (&arg_py_state)[MAX_NUM_STATES]):
        index(index), num_states(num_states)
      {
+       //pythonState_lock.lock();        
       //  ctxid_pcs = std::vector<u64>{};  // init as empty vector
        for (int i = 0; i < (num_states < MAX_NUM_STATES ? num_states : MAX_NUM_STATES); i++){
          strcpy(py_state[i].file_name, arg_py_state[i].file_name);
-         strcpy(py_state[i].function_name, arg_py_state[i].function_name);
+         if (num_states > 0 && strlen(arg_py_state[i].function_name) == 0) {
+          printf("Fatal, empty function name, file: %s \n", py_state[i].file_name);
+          // py_state[i].function_name = "run_one_step\0";
+         } else {
+          strcpy(py_state[i].function_name, arg_py_state[i].function_name);
+         }
          py_state[i].function_first_lineno = arg_py_state[i].function_first_lineno;
          py_state[i].lineno = arg_py_state[i].lineno;
        }
+       //pythonState_lock.unlock(); 
      };
 
      PyStateCTX(){};
@@ -412,6 +451,42 @@ namespace redshow {
    }
    
 
+   ViewNode* find_triton_view_node(torch_monitor_callback_tensor_data_t& tensor_data) {
+     ViewNode* result = nullptr;
+     lock();
+
+     data_ptr_t data_ptr = (data_ptr_t)tensor_data.data_ptr;
+     metadata_ptr_t metadata_ptr = (metadata_ptr_t)tensor_data.metadata_ptr;
+     ViewNode temp = ViewNode{data_ptr, metadata_ptr, tensor_data.numel, tensor_data.itemsize};
+     std::vector<ViewNode*> root_found = find_root_node(temp);
+     ViewNode *view_existed;
+     if(!root_found.empty()) {
+       for (auto riter = root_found.begin(); riter != root_found.end(); riter++) {
+         view_existed = (*riter)->find_node(temp);
+         if (view_existed){
+           result = view_existed;  // Return type: exists a view node
+           break;
+         }
+       }
+       if (view_existed) {
+         // Update Python State
+         // std::cout << "Checkpoint 1" << std::endl;
+         PyStateCTX _state{tensor_data.index, num_states, python_states};
+         _state.object_type = VIEW_NODE;
+         call_path_map[view_existed->view_id].push_back(_state);
+       } else {
+         result = root_found[0];
+         // std::cout << "Checkpoint 2" << std::endl;
+         PyStateCTX _state{tensor_data.index, num_states, python_states};
+         _state.object_type = VIEW_NODE;
+         call_path_map[result->view_id].push_back(_state);
+       }
+     }
+     unlock();
+     return result;
+   }
+
+
   /**
    * add a node to the forest iif captured a new tensor/view
    * increase the corresponding _total_access by 1 if the tensor/view exists
@@ -440,7 +515,28 @@ namespace redshow {
        }
        if (view_existed) {
          // Update Python State
-         PyStateCTX _state{tensor_data.index, num_states, python_states};
+         if (call_path_map[view_existed->view_id].rbegin()->ctxid_pcs.empty() &&
+             (call_path_map[view_existed->view_id].rbegin()->num_states * num_states) > 0 &&
+             call_path_map[view_existed->view_id].rbegin()->py_state[0].lineno == python_states[0].lineno) {
+          call_path_map[view_existed->view_id].erase(std::prev(call_path_map[view_existed->view_id].end()));
+         }
+         // std::cout << "Checkpoint 3" << std::endl;
+         // PyStateCTX _state{tensor_data.index, num_states, python_states};
+
+          //pythonState_lock.lock();
+          torch_monitor_status_t state = torch_monitor_python_state_get(MAX_NUM_STATES, python_states, &num_states);
+          if (state != TORCH_MONITOR_STATUS_SUCCESS) {
+            std::cout << "Get 0 resultes forest update" << std::endl;
+          }
+          //pythonState_lock.unlock();
+
+         PyStateCTX _state;
+         if (!is_domain_enter && _delayed_trace && _delayed_trace->python_state.num_states > 0){
+           _state = _delayed_trace->python_state;
+         } else{
+           _state = PyStateCTX{tensor_data.index, num_states, python_states};
+         }
+
          if (!_domain_name.empty()) {
            if (num_states > 0) {
              strcat(_state.py_state[0].function_name, "^");
@@ -482,6 +578,7 @@ namespace redshow {
              _input_view->_children.push_back(_node);
              result = _node; // Return type: return the new childe
              call_path_map[global_id] = std::vector<PyStateCTX>();
+             // std::cout << "Checkpoint 4" << std::endl;
              PyStateCTX _state{tensor_data.index, num_states, python_states};
              if (!_domain_name.empty()) {
                if (num_states > 0) {
@@ -502,9 +599,23 @@ namespace redshow {
        //_roots.push_back(_root_node_ptr);
        auto it = std::lower_bound(_roots.begin(), _roots.end(), _root_node_ptr, ViewNode_ptr_comp);
        _roots.insert(it, _root_node_ptr);
+       // std::cout << "Insert a root: " << global_id << " data_ptr: " << std::hex << data_ptr << std::dec << std::endl;
        result = _root_node_ptr; // Return type: the new root
        call_path_map[global_id] = std::vector<PyStateCTX>();
-       PyStateCTX _state{tensor_data.index, num_states, python_states};
+       //std::cout << "Checkpoint 5" << std::endl;
+       // PyStateCTX _state{tensor_data.index, num_states, python_states};
+       PyStateCTX _state;
+       if (!is_domain_enter && _delayed_trace && _delayed_trace->python_state.num_states > 0){
+        _state = _delayed_trace->python_state;
+       } else{
+          //pythonState_lock.lock();
+          torch_monitor_status_t state = torch_monitor_python_state_get(MAX_NUM_STATES, python_states, &num_states);
+          if (state != TORCH_MONITOR_STATUS_SUCCESS) {
+            std::cout << "Get 0 resultes forest update" << std::endl;
+          }
+          //pythonState_lock.unlock();
+        _state = PyStateCTX{tensor_data.index, num_states, python_states};
+       }
        if (!_domain_name.empty()) {
          if (num_states > 0) {
            strcat(_state.py_state[0].function_name, "^");
@@ -514,6 +625,20 @@ namespace redshow {
        _state.object_type = VIEW_NODE;
        call_path_map[global_id].push_back(_state);
      } // add a new root
+     /**
+      * Add inter-tree relation
+      * Create an edge from result(tensor) to domain input tensors _input_viewnode_forest_ptrs
+      * This type of relation can be one-to-many
+      * One-to-many relation facilitate 
+      * Reuse the same forest parser in hpcprof
+      * Reverse the scourse and target nodes in hpcprof to get the many to one relation
+      * 
+     */
+     for (auto [idx, node_ptr] : _input_viewnode_forest_ptrs) {
+       if (result != node_ptr && result && node_ptr) {
+         cross_tree_target_scources[result->view_id].insert(node_ptr->view_id);
+       }
+     }
      unlock();
      return result;
    }
@@ -535,6 +660,55 @@ namespace redshow {
      }
    }
 #endif
+   /**
+    * Called by update_sub_tree_hash_set
+   */
+   std::size_t get_node_hash(const std::size_t parent_hash, const ViewNode* node_ptr) {
+    std::stringstream all_states = {};
+    all_states << parent_hash;
+    const u64 view_id = node_ptr->view_id;
+    for (auto state : call_path_map[view_id]) {
+      for (size_t i = 0; i < state.num_states; i++) {
+        all_states << state.py_state[i].file_name << state.py_state[i].lineno;
+        for (auto [ctx_id, pcs] : state.ctxid_pcs) {
+          all_states << ctx_id;
+        }
+      }
+    }
+    return (std::size_t)std::hash<std::string>{}(all_states.str());
+   }
+
+   std::set<std::size_t> node_hash_set = {};
+
+   /**
+    * Check every time we delete a tree
+   */
+   bool update_sub_tree_hash_set (const std::size_t start_hash, const ViewNode* start_node) {
+    bool ret = true;
+    std::size_t _hash = get_node_hash(start_hash, start_node);
+    bool find_ret = (node_hash_set.find(_hash) != node_hash_set.end());
+    if(!find_ret) {
+      node_hash_set.insert(_hash);
+    }
+    ret &= find_ret;
+    for (auto _child : start_node->_children) {
+      ret &= update_sub_tree_hash_set(_hash, _child);
+    }
+    return ret;
+   }
+
+
+   void delete_children_no_side_effect(ViewNode* node) {
+    const u64 view_id = node->view_id;
+    call_path_map.erase(view_id);
+    cross_tree_target_scources.erase(node->view_id); // remove useless cross tree relations
+    for(auto _child: node->_children) {
+      delete_children_no_side_effect(_child);
+      delete _child;
+    }
+    node->_children.clear();
+   } 
+
 
    /**
     * delete a tree(gaven a tensor ptr) from the forest
@@ -563,18 +737,30 @@ namespace redshow {
          break;
        }
        if (_roots.at(i)->mem_block_range.first >= mem_start_addr){
-         /** 
-          * if the tree has no children, and the root has no ctx-pc access 
-          * */
-         if (_roots.at(i)->_children.empty() && call_path_map[_roots.at(i)->view_id].size() <= 1 && call_path_map[_roots.at(i)->view_id].at(0).ctxid_pcs.empty()) {
-           auto _dead = call_path_map.find(_roots.at(i)->view_id);
-           if (_dead != call_path_map.end()) {
-             call_path_map.erase(_dead);
-           }
+         bool first_print = update_sub_tree_hash_set(0, _roots.at(i));
+         if (first_print) {
+          std::cout << "NOT the first time " << _roots.at(i)->view_id << std::endl;
+          delete_children_no_side_effect(_roots.at(i));
          } else {
-           viewnode_mem_range_map.erase(_roots.at(i)->view_id); // erase anyway. used by ongpu analysis
-           _roots.at(i)->delete_children_nodes(forest_tree_out, viewnode_mem_range_map);
-           forest_tree_out << '\n';
+          std::cout << "The first time." << _roots.at(i)->view_id << std::endl;
+          // logic
+          /** 
+            * if the tree has no children, and the root has no ctx-pc access 
+            * */
+          if (_roots.at(i)->_children.empty() 
+              && call_path_map[_roots.at(i)->view_id].size() <= 1 
+              && call_path_map[_roots.at(i)->view_id].at(0).ctxid_pcs.empty()) {
+            std::cout << "Prune Tree with Root ID: " << _roots.at(i)->view_id << std::endl;
+            cross_tree_target_scources.erase(_roots.at(i)->view_id);
+            auto _dead = call_path_map.find(_roots.at(i)->view_id);
+            if (_dead != call_path_map.end()) {
+              call_path_map.erase(_dead);
+            }
+          } else {
+            viewnode_mem_range_map.erase(_roots.at(i)->view_id); // erase anyway. used by ongpu analysis
+            _roots.at(i)->delete_children_nodes(forest_tree_out, viewnode_mem_range_map);
+            forest_tree_out << '\n';
+          }
          }
          delete _roots.at(i);
          _roots.erase(_roots.begin()+i);
@@ -585,6 +771,26 @@ namespace redshow {
      unlock();
    }
 
+   void dump_cross_tree_relation_at_system_flush(const std::string &output_dir) {
+    std::ofstream cross_tree_out(output_dir + "cross_tree_relations.txt");
+    if (!cross_tree_target_scources.empty()){
+      for(auto& [target, scources] : cross_tree_target_scources) {
+        cross_tree_out << target << ": { " << std::endl;
+        if (!scources.empty()) {
+          for(auto& src : scources) {
+            if(src) {
+              cross_tree_out << src << ": { }" << src << '\n';
+            }
+          }
+        }
+        cross_tree_out << " }" << target << std::endl << std::endl;
+      }
+    }
+
+    cross_tree_target_scources.clear();
+    cross_tree_out.close();
+   }
+
    /**
     * add view_node _total_access by one
     * @param a list of view_nodes
@@ -592,23 +798,6 @@ namespace redshow {
     */
    void update_node_total_access(std::vector<ViewNode*> view_nodes, uint64_t pc) {
      // lock(); // TODO: Try fix later: another lock; Or try to make it sequential
-    //  for (auto viter : view_nodes) {
-    //    std::vector<ViewNode*> _root_node = find_root_node(*viter);
-    //    if (_root_node.empty()) {
-    //      continue;
-    //    }
-    //    ViewNode *_node;
-    //    for (auto riter = _root_node.begin(); riter != _root_node.end(); riter++) {
-    //      _node = (*riter)->find_node(*viter);
-    //      if (_node)
-    //        break;
-    //    }
-    //    if(_node->pc_access.find(pc) != _node->pc_access.end()) {
-    //      _node->pc_access[pc]++;
-    //    } else {
-    //     _node->pc_access[pc] = 1;
-    //    }
-    //  }
      for (auto viter : view_nodes) {
        if(viter->pc_access.find(pc) != viter->pc_access.end()) {
          viter->pc_access[pc]++;
@@ -857,6 +1046,7 @@ namespace redshow {
        u64 sit = (u64)temp_tensor->data_ptr;
        for(int64_t i = 0; i < (dim-1); i++) {
          sit = find_local_starting_address(sit, sizes[i], strides[i], itemsize, mem_addr_hit);
+         std::cout << "Iter close sit: " << std::hex << sit << std::dec << std::endl;
          if(sit == 0)
            break;
        }
@@ -906,13 +1096,15 @@ namespace redshow {
      for(int i = 0; i < sorted.size(); i++){
        uint64_t itemsize = sorted[i]->itemsize;
        u64 sit = find_closest_starting_address(sorted[i], itemsize, mem_addr_hit);
-       if(sit != 0){
+       std::cout << "Print sit ptr: " << std::hex << sit << std::dec << std::endl; 
+       // if(sit != 0){
+       if(sit >= sorted[i]->data_ptr && sit <= sorted[i]->mem_block_range.second) {
            if((mem_addr_hit == sit)
              ||
                ((mem_addr_hit - sit) < sorted[i]->sizes[sorted[i]->dim - 1] * (sorted[i]->strides[sorted[i]->dim - 1] * itemsize)
                &&
                (mem_addr_hit - sit) % (sorted[i]->strides[sorted[i]->dim - 1] * itemsize) == 0)){
-           hit.push_back(possible[i]);
+           hit.push_back(sorted[i]);
          }
        }
        // delete(sorted[i]);
@@ -990,6 +1182,7 @@ namespace redshow {
   
   public:
    void map_delayed_access(){
+    // std::cout << "Enter map_delayed_access" << std::endl;
     std::map<uint64_t, std::vector<ViewNode*>> _pc_node_cache;
     // STEP 1
     // Update the call_path_map with _delayed data
@@ -1003,6 +1196,7 @@ namespace redshow {
       for (auto& [pc, m_c] :  _delayed_trace->access_memory) {
         for (auto& [m, c] : m_c) {
           u64 mem_start = m;
+          // std::cout << "Delayed Kernel Access: PC: " << pc << " Mem Start: " << mem_start  << std::endl;
           std::vector<ViewNode*> view_node_hit_mem;
 
           if(_pc_node_cache.find(pc) != _pc_node_cache.end()) {
@@ -1017,6 +1211,11 @@ namespace redshow {
           // Update Call ctc_id to CallPath TODO(Done): use the old python state and then insert ctx_id
           for (auto viter = view_node_hit_mem.begin(); viter != view_node_hit_mem.end(); viter++){
             _delayed_trace->python_state.object_type = VIEW_NODE;
+            if (call_path_map[(*viter)->view_id].size() == 1 && 
+                call_path_map[(*viter)->view_id].begin()->num_states > 0 &&
+                call_path_map[(*viter)->view_id].begin()->py_state[0].lineno == _delayed_trace->python_state.py_state[0].lineno) {
+              call_path_map[(*viter)->view_id].erase(std::prev(call_path_map[(*viter)->view_id].end()));
+            }
             call_path_map[(*viter)->view_id].push_back(_delayed_trace->python_state);
             call_path_map[(*viter)->view_id].back().ctxid_pcs[c].push_back(pc);
             if(_delayed_trace->write_pcs.find(pc) != _delayed_trace->write_pcs.end()) {

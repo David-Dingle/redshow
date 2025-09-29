@@ -10,6 +10,11 @@ include $(CONFIGS)
 
 CC := g++
 
+#PYTHON_VERSION := 3.11 # Adjust to your Python version
+PYTHON_INCLUDE := $(shell python3 -c "from sysconfig import get_paths as gp; print(gp()['include'])")
+PYTHON_LIB := $(shell python3-config --embed --ldflags)  #$(shell python$(PYTHON_VERSION)-config --ldflags)
+PYBIND11_INCLUDE := $(PYTORCH_DIR)/../pybind11/include/
+
 LIB_DIR := lib/
 INC_DIR := include/
 BIN_DIR := bin/
@@ -70,14 +75,14 @@ $(LIB_DIR):
 	mkdir -p $@
 
 $(BINS): % : $(SRC_DIR)%.cpp $(OBJECTS)
-	$(CC) $(CFLAGS) -I$(INC_DIR) -I$(BOOST_DIR)/include -I$(GPU_PATCH_DIR)/include -I$(TORCH_MONITOR_DIR)/include \
--L$(TORCH_MONITOR_DIR)/lib -Wl,-rpath=$(TORCH_MONITOR_DIR)/lib -L$(LIBUNWIND_DIR)/lib -o $@ $^ -ltorch_monitor -lunwind
+	$(CC) $(CFLAGS) -I$(INC_DIR) -I$(BOOST_DIR)/include -I$(GPU_PATCH_DIR)/include -I$(PYTHON_INCLUDE) -I$(PYBIND11_INCLUDE) -I$(TORCH_MONITOR_DIR)/include \
+-L$(TORCH_MONITOR_DIR)/lib -Wl,-rpath=$(TORCH_MONITOR_DIR)/lib -L$(LIBUNWIND_DIR)/lib -o $@ $^ -ltorch_monitor -lunwind $(PYTHON_LIB)
 
 $(LIB): $(OBJECTS)
-	$(CC) $(LDFLAGS) -L$(TORCH_MONITOR_DIR)/lib -Wl,-rpath=$(TORCH_MONITOR_DIR)/lib -o $@ $^ -ltorch_monitor
+	$(CC) $(LDFLAGS) -L$(TORCH_MONITOR_DIR)/lib -Wl,-rpath=$(TORCH_MONITOR_DIR)/lib $(PYTHON_LIB) -L$(LIBUNWIND_DIR)/lib -o $@ $^ -ltorch_monitor -lunwind
 
 $(OBJECTS): $(BUILD_DIR)%.o : %.cpp
-	$(CC) $(CFLAGS) -I$(INC_DIR) -I$(BOOST_DIR)/include -I$(GPU_PATCH_DIR)/include \
+	$(CC) $(CFLAGS) -I$(INC_DIR) -I$(BOOST_DIR)/include -I$(GPU_PATCH_DIR)/include -I$(PYTHON_INCLUDE) -I$(PYBIND11_INCLUDE) \
 -I$(TORCH_MONITOR_DIR)/include -I$(LIBUNWIND_DIR)/include -o $@ -c $<
 
 clean:
